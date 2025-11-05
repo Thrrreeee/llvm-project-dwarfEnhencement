@@ -3658,7 +3658,7 @@ void RewriteInstance::emitAndLink() {
     } else {
       // Make .eh_frame relocatable.
       relocateEHFrameSection();
-    }
+    }  
   }
 
   emitBinaryContext(*Streamer, *BC, getOrgSecPrefix());

@@ -51,8 +51,15 @@ void AddressMap::emit(MCStreamer &Streamer, BinaryContext &BC) {
       Streamer.switchSection(BC.getDataSection(LabelSectionName));
       emitLabel(Streamer, BB.getLabel());
 
-      if (!BB.hasLocSyms())
+      if (!BB.hasLocSyms()) {
+        // // Fallback: emit a BB-entry mapping when no loc syms exist but BB has
+        // // a valid input offset. This ensures sparse coverage is filled.
+        // if (BB.getInputOffset() != BinaryBasicBlock::INVALID_OFFSET) {
+        //   Streamer.switchSection(BC.getDataSection(AddressSectionName));
+        //   emitAddress(Streamer, BFAddress + BB.getInputOffset(), BB.getLabel());
+        // }
         continue;
+      }
 
       Streamer.switchSection(BC.getDataSection(AddressSectionName));
       for (auto [Offset, Symbol] : BB.getLocSyms())
@@ -95,8 +102,8 @@ std::optional<AddressMap> AddressMap::parse(BinaryContext &BC) {
     Parsed.Address2AddressMap.reserve(AddressMapSection->getOutputSize() /
                                       EntrySize);
     parseSection(*AddressMapSection, [&](uint64_t Input, uint64_t Output) {
-      if (!Parsed.Address2AddressMap.count(Input))
-        Parsed.Address2AddressMap.insert({Input, Output});
+      // Preserve all input-to-output mappings, including duplicates for clones.
+      Parsed.Address2AddressMap.emplace(Input, Output);
     });
   }
 

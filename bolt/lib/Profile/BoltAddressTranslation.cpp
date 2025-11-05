@@ -56,7 +56,7 @@ void BoltAddressTranslation::writeEntriesForBB(
   // allowing it to overwrite the previously inserted key in the map.
   Map.emplace(BBOutputOffset, BBInputOffset << 1);
 
-  const auto &IOAddressMap =
+  auto &IOAddressMap =
       BB.getFunction()->getBinaryContext().getIOAddressMap();
 
   for (const auto &[InputOffset, Sym] : BB.getLocSyms()) {
