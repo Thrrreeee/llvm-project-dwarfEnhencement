@@ -1527,7 +1527,7 @@ public:
   }
 
   void setIOAddressMap(AddressMap Map) { IOAddressMap = std::move(Map); }
-  const AddressMap &getIOAddressMap() const {
+  AddressMap &getIOAddressMap() {
     assert(IOAddressMap && "Address map not set yet");
     return *IOAddressMap;
   }

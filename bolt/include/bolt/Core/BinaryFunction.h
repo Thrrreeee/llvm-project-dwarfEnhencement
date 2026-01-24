@@ -34,6 +34,7 @@
 #include "bolt/Core/FunctionLayout.h"
 #include "bolt/Core/JumpTable.h"
 #include "bolt/Core/MCPlus.h"
+#include "bolt/Core/InstructionAnnotations.h"
 #include "bolt/Utils/NameResolver.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
@@ -216,6 +217,9 @@ public:
   using cfi_iterator = CFIInstrMapType::iterator;
   using const_cfi_iterator = CFIInstrMapType::const_iterator;
 
+  // 新增：InstructionAnnotations 访问器
+  InstructionAnnotations &getInstructionAnnotations() { return InstAnnotations; }
+  const InstructionAnnotations &getInstructionAnnotations() const { return InstAnnotations; }
 private:
   /// Current state of the function.
   State CurrentState{State::Empty};
@@ -281,6 +285,8 @@ private:
   /// is a global symbol corresponding to an external entry point.
   DenseMap<const MCSymbol *, MCSymbol *> SecondaryEntryPoints;
 
+  //每函数的 MCInst 注解侧表
+  InstructionAnnotations InstAnnotations;
   /// False if the function is too complex to reconstruct its control
   /// flow graph.
   /// In relocation mode we still disassemble and re-assemble such functions.

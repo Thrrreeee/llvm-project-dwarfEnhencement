@@ -1390,8 +1390,8 @@ DWARFDebugLine::LineTable::lookupAllAddresses(object::SectionedAddress Address) 
 
 void DWARFDebugLine::LineTable::lookupAllAddressesImpl(
     object::SectionedAddress Address, std::vector<uint32_t> &Result) const {
-  
-  // First, find an instruction sequence containing the given address.
+
+  // 1. 定位 Sequence (保持不变)
   DWARFDebugLine::Sequence Sequence;
   Sequence.SectionIndex = Address.SectionIndex;
   Sequence.HighPC = Address.Address;
@@ -1400,17 +1400,56 @@ void DWARFDebugLine::LineTable::lookupAllAddressesImpl(
   if (It == Sequences.end() || It->SectionIndex != Address.SectionIndex)
     return;
 
-  // Find all rows with matching address in this sequence
-  RowIter FirstRow = Rows.begin() + It->FirstRowIndex;
-  RowIter LastRow = Rows.begin() + It->LastRowIndex;
-  
-  for (RowIter RowIt = FirstRow; RowIt != LastRow; ++RowIt) {
-    if (RowIt->Address.Address == Address.Address && 
-        RowIt->Address.SectionIndex == Address.SectionIndex) {
-      Result.push_back(RowIt - Rows.begin());
-    }
+  // 2. 使用 findRowInSeq 找到“最符合”的一个基准行
+  // 注意：如果是精确地址匹配，findRowInSeq 通常返回的是该地址序列的【最后一个】
+  uint32_t RowIndex = findRowInSeq(*It, Address);
+  if (RowIndex == UnknownRowIndex)
+    return;
+
+  // 3. 【新逻辑】确定要遍历的候选行范围 [FirstCandidate, LastCandidate]
+  uint32_t FirstCandidate = RowIndex;
+  uint32_t LastCandidate = RowIndex;
+
+  // 检查是否是精确地址匹配 (Address == Row.Address)
+  if (Rows[RowIndex].Address.Address == Address.Address) {
+      // 如果是精确匹配，说明可能存在多个同地址的行。
+      // 因为 findRowInSeq 返回的是最后一个，我们需要向前倒推，找到该地址的第一个行。
+      while (FirstCandidate > It->FirstRowIndex && 
+             Rows[FirstCandidate - 1].Address.Address == Address.Address) {
+          FirstCandidate--;
+      }
+      // LastCandidate 保持为 RowIndex (即最后一个匹配项)
+  } 
+  // else: 如果是区间匹配 (Address > Row.Address)，说明指令在某一行中间，
+  // 这种情况下逻辑上只有一行覆盖该地址，FirstCandidate == LastCandidate。
+
+  // 4. 【循环处理】对范围内的每一行，单独应用 "Line 0 回溯" 逻辑
+  for (uint32_t CurrentIdx = FirstCandidate; CurrentIdx <= LastCandidate; ++CurrentIdx) {
+      
+      uint32_t ApproxRowIndex = CurrentIdx;
+
+      // === Line 0 回溯逻辑 (针对当前遍历到的这一行) ===
+      // 这里的逻辑是你之前定义的：如果是Line 0，就往前找非0的
+      while (ApproxRowIndex >= It->FirstRowIndex && Rows[ApproxRowIndex].Line == 0) {
+          if (ApproxRowIndex == It->FirstRowIndex) {
+              // 已经退无可退，只能接受原始结果
+              ApproxRowIndex = CurrentIdx; 
+              break;
+          }
+          ApproxRowIndex--;
+      }
+      
+      // === 插入结果 ===
+      // 如果回溯成功找到了非0行，优先加入非0行
+      if (Rows[ApproxRowIndex].Line != 0) {
+          Result.push_back(ApproxRowIndex);
+      } else {
+          // 如果回溯失败（全是0），这里插入原始找到的行(CurrentIdx)
+          Result.push_back(CurrentIdx);
+      }
   }
 }
+
 
 bool DWARFDebugLine::LineTable::lookupAddressRange(
     object::SectionedAddress Address, uint64_t Size,
