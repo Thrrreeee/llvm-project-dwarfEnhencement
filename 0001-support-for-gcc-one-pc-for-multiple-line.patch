@@ -1,0 +1,459 @@
+From 1df3ed7793fd86f04216afffc9a658dc0f184dd9 Mon Sep 17 00:00:00 2001
+From: jinruiShi <1379998393@qq.com>
+Date: Mon, 20 Oct 2025 19:48:21 +0800
+Subject: [PATCH 1/2] support for gcc one pc for multiple line
+
+---
+ bolt/lib/Core/BinaryContext.cpp               |  54 ++++----
+ bolt/lib/Core/BinaryEmitter.cpp               | 122 ++++++++++--------
+ bolt/lib/Core/BinaryFunction.cpp              |  38 +++---
+ .../llvm/DebugInfo/DWARF/DWARFDebugLine.h     |   9 ++
+ llvm/include/llvm/MC/MCInst.h                 |  15 ++-
+ llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp   |  43 ++++++
+ llvm/lib/MC/MCDwarf.cpp                       |   4 +-
+ 7 files changed, 187 insertions(+), 98 deletions(-)
+
+diff --git a/bolt/lib/Core/BinaryContext.cpp b/bolt/lib/Core/BinaryContext.cpp
+index 84f185346970..1d6bbc31e72a 100644
+--- a/bolt/lib/Core/BinaryContext.cpp
++++ b/bolt/lib/Core/BinaryContext.cpp
+@@ -1769,7 +1769,11 @@ void BinaryContext::preprocessDebugInfo() {
+       continue;
+     }
+     const uint32_t Offset = DwarfVersion < 5 ? 1 : 0;
+-    for (size_t I = 0, Size = FileNames.size(); I != Size; ++I) {
++    size_t I = 0;
++    if (DwarfVersion >= 5) {
++      I = 1;
++    }
++    for (size_t Size = FileNames.size(); I != Size; ++I) {
+       // Dir indexes start at 1, as DWARF file numbers, and a dir index 0
+       // means empty dir.
+       StringRef Dir = "";
+@@ -1907,31 +1911,33 @@ bool BinaryContext::isMarker(const SymbolRef &Symbol) const {
+ static void printDebugInfo(raw_ostream &OS, const MCInst &Instruction,
+                            const BinaryFunction *Function,
+                            DWARFContext *DwCtx) {
+-  DebugLineTableRowRef RowRef =
+-      DebugLineTableRowRef::fromSMLoc(Instruction.getLoc());
+-  if (RowRef == DebugLineTableRowRef::NULL_ROW)
+-    return;
++  for(auto loc : Instruction.getLocs()){
++    DebugLineTableRowRef RowRef =
++        DebugLineTableRowRef::fromSMLoc(loc);
++    if (RowRef == DebugLineTableRowRef::NULL_ROW)
++      return;
+ 
+-  const DWARFDebugLine::LineTable *LineTable;
+-  if (Function && Function->getDWARFUnit() &&
+-      Function->getDWARFUnit()->getOffset() == RowRef.DwCompileUnitIndex) {
+-    LineTable = Function->getDWARFLineTable();
+-  } else {
+-    LineTable = DwCtx->getLineTableForUnit(
+-        DwCtx->getCompileUnitForOffset(RowRef.DwCompileUnitIndex));
++    const DWARFDebugLine::LineTable *LineTable;
++    if (Function && Function->getDWARFUnit() &&
++        Function->getDWARFUnit()->getOffset() == RowRef.DwCompileUnitIndex) {
++      LineTable = Function->getDWARFLineTable();
++    } else {
++      LineTable = DwCtx->getLineTableForUnit(
++          DwCtx->getCompileUnitForOffset(RowRef.DwCompileUnitIndex));
++    }
++    assert(LineTable && "line table expected for instruction with debug info");
++
++    const DWARFDebugLine::Row &Row = LineTable->Rows[RowRef.RowIndex - 1];
++    StringRef FileName = "";
++    if (std::optional<const char *> FName =
++            dwarf::toString(LineTable->Prologue.FileNames[Row.File - 1].Name))
++      FileName = *FName;
++    OS << " # debug line " << FileName << ":" << Row.Line;
++    if (Row.Column)
++      OS << ":" << Row.Column;
++    if (Row.Discriminator)
++      OS << " discriminator:" << Row.Discriminator;
+   }
+-  assert(LineTable && "line table expected for instruction with debug info");
+-
+-  const DWARFDebugLine::Row &Row = LineTable->Rows[RowRef.RowIndex - 1];
+-  StringRef FileName = "";
+-  if (std::optional<const char *> FName =
+-          dwarf::toString(LineTable->Prologue.FileNames[Row.File - 1].Name))
+-    FileName = *FName;
+-  OS << " # debug line " << FileName << ":" << Row.Line;
+-  if (Row.Column)
+-    OS << ":" << Row.Column;
+-  if (Row.Discriminator)
+-    OS << " discriminator:" << Row.Discriminator;
+ }
+ 
+ ArrayRef<uint8_t> BinaryContext::extractData(uint64_t Address,
+diff --git a/bolt/lib/Core/BinaryEmitter.cpp b/bolt/lib/Core/BinaryEmitter.cpp
+index 7b5cd276fee8..b64e2085bff3 100644
+--- a/bolt/lib/Core/BinaryEmitter.cpp
++++ b/bolt/lib/Core/BinaryEmitter.cpp
+@@ -18,6 +18,7 @@
+ #include "bolt/Core/FunctionLayout.h"
+ #include "bolt/Utils/CommandLineOpts.h"
+ #include "bolt/Utils/Utils.h"
++#include "llvm/ADT/SmallVector.h"
+ #include "llvm/DebugInfo/DWARF/DWARFCompileUnit.h"
+ #include "llvm/MC/MCSection.h"
+ #include "llvm/MC/MCStreamer.h"
+@@ -170,7 +171,7 @@ private:
+   /// to a new temp symbol used with \p NewLoc.
+   ///
+   /// Return new current location which is either \p NewLoc or \p PrevLoc.
+-  SMLoc emitLineInfo(const BinaryFunction &BF, SMLoc NewLoc, SMLoc PrevLoc,
++  SmallVector<SMLoc, 4> emitLineInfo(const BinaryFunction &BF, SmallVector<SMLoc, 4> NewLocs, SmallVector<SMLoc, 4> PrevLocs,
+                      bool FirstInstr, MCSymbol *&InstrLabel);
+ 
+   /// Use \p FunctionEndSymbol to mark the end of the line info sequence.
+@@ -469,7 +470,7 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
+         Streamer.emitLabel(EntrySymbol);
+     }
+ 
+-    SMLoc LastLocSeen;
++    SmallVector<SMLoc, 4> LastLocSeen;
+     for (auto I = BB->begin(), E = BB->end(); I != E; ++I) {
+       MCInst &Instr = *I;
+ 
+@@ -487,7 +488,7 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
+         MCSymbol *InstrLabel = BC.MIB->getInstLabel(Instr);
+ 
+         if (opts::UpdateDebugSections && BF.getDWARFUnit()) {
+-          LastLocSeen = emitLineInfo(BF, Instr.getLoc(), LastLocSeen,
++          LastLocSeen = emitLineInfo(BF, Instr.getLocs(), LastLocSeen,
+                                      FirstInstr, InstrLabel);
+           FirstInstr = false;
+         }
+@@ -676,67 +677,76 @@ void BinaryEmitter::emitConstantIslands(BinaryFunction &BF, bool EmitColdPart,
+     emitConstantIslands(*ExternalFunc, EmitColdPart, &BF);
+ }
+ 
+-SMLoc BinaryEmitter::emitLineInfo(const BinaryFunction &BF, SMLoc NewLoc,
+-                                  SMLoc PrevLoc, bool FirstInstr,
++SmallVector<SMLoc, 4>  BinaryEmitter::emitLineInfo(const BinaryFunction &BF, SmallVector<SMLoc, 4> NewLocs,
++                                  SmallVector<SMLoc, 4> PrevLocs, bool FirstInstr,
+                                   MCSymbol *&InstrLabel) {
+   DWARFUnit *FunctionCU = BF.getDWARFUnit();
+   const DWARFDebugLine::LineTable *FunctionLineTable = BF.getDWARFLineTable();
+   assert(FunctionCU && "cannot emit line info for function without CU");
+ 
+-  DebugLineTableRowRef RowReference = DebugLineTableRowRef::fromSMLoc(NewLoc);
+-
+-  // Check if no new line info needs to be emitted.
+-  if (RowReference == DebugLineTableRowRef::NULL_ROW ||
+-      NewLoc.getPointer() == PrevLoc.getPointer())
+-    return PrevLoc;
+-
+-  unsigned CurrentFilenum = 0;
+-  const DWARFDebugLine::LineTable *CurrentLineTable = FunctionLineTable;
+-
+-  // If the CU id from the current instruction location does not
+-  // match the CU id from the current function, it means that we
+-  // have come across some inlined code.  We must look up the CU
+-  // for the instruction's original function and get the line table
+-  // from that.
+-  const uint64_t FunctionUnitIndex = FunctionCU->getOffset();
+-  const uint32_t CurrentUnitIndex = RowReference.DwCompileUnitIndex;
+-  if (CurrentUnitIndex != FunctionUnitIndex) {
+-    CurrentLineTable = BC.DwCtx->getLineTableForUnit(
+-        BC.DwCtx->getCompileUnitForOffset(CurrentUnitIndex));
+-    // Add filename from the inlined function to the current CU.
+-    CurrentFilenum = BC.addDebugFilenameToUnit(
+-        FunctionUnitIndex, CurrentUnitIndex,
+-        CurrentLineTable->Rows[RowReference.RowIndex - 1].File);
+-  }
+-
+-  const DWARFDebugLine::Row &CurrentRow =
+-      CurrentLineTable->Rows[RowReference.RowIndex - 1];
+-  if (!CurrentFilenum)
+-    CurrentFilenum = CurrentRow.File;
+-
+-  unsigned Flags = (DWARF2_FLAG_IS_STMT * CurrentRow.IsStmt) |
+-                   (DWARF2_FLAG_BASIC_BLOCK * CurrentRow.BasicBlock) |
+-                   (DWARF2_FLAG_PROLOGUE_END * CurrentRow.PrologueEnd) |
+-                   (DWARF2_FLAG_EPILOGUE_BEGIN * CurrentRow.EpilogueBegin);
+-
+-  // Always emit is_stmt at the beginning of function fragment.
+-  if (FirstInstr)
+-    Flags |= DWARF2_FLAG_IS_STMT;
+-
+-  BC.Ctx->setCurrentDwarfLoc(CurrentFilenum, CurrentRow.Line, CurrentRow.Column,
+-                             Flags, CurrentRow.Isa, CurrentRow.Discriminator);
+-  const MCDwarfLoc &DwarfLoc = BC.Ctx->getCurrentDwarfLoc();
+-  BC.Ctx->clearDwarfLocSeen();
++  SmallVector<SMLoc, 4> ResultLocs;
++  
++  // 处理每个位置信息
++  for (size_t i = 0; i < NewLocs.size(); ++i) {
++    SMLoc NewLoc = NewLocs[i];
++    SMLoc PrevLoc = (i < PrevLocs.size()) ? PrevLocs[i] : SMLoc();
++    
++    DebugLineTableRowRef RowReference = DebugLineTableRowRef::fromSMLoc(NewLoc);
++
++    // Check if no new line info needs to be emitted.
++    if (RowReference == DebugLineTableRowRef::NULL_ROW ||
++        NewLoc.getPointer() == PrevLoc.getPointer()) {
++      ResultLocs.push_back(PrevLoc);
++      continue;
++    }
+ 
+-  if (!InstrLabel)
+-    InstrLabel = BC.Ctx->createTempSymbol();
++    unsigned CurrentFilenum = 0;
++    const DWARFDebugLine::LineTable *CurrentLineTable = FunctionLineTable;
++
++    // If the CU id from the current instruction location does not
++    // match the CU id from the current function, it means that we
++    // have come across some inlined code.
++    const uint64_t FunctionUnitIndex = FunctionCU->getOffset();
++    const uint32_t CurrentUnitIndex = RowReference.DwCompileUnitIndex;
++    if (CurrentUnitIndex != FunctionUnitIndex) {
++      CurrentLineTable = BC.DwCtx->getLineTableForUnit(
++          BC.DwCtx->getCompileUnitForOffset(CurrentUnitIndex));
++      // Add filename from the inlined function to the current CU.
++      CurrentFilenum = BC.addDebugFilenameToUnit(
++          FunctionUnitIndex, CurrentUnitIndex,
++          CurrentLineTable->Rows[RowReference.RowIndex - 1].File);
++    }
+ 
+-  BC.getDwarfLineTable(FunctionUnitIndex)
+-      .getMCLineSections()
+-      .addLineEntry(MCDwarfLineEntry(InstrLabel, DwarfLoc),
+-                    Streamer.getCurrentSectionOnly());
++    const DWARFDebugLine::Row &CurrentRow =
++        CurrentLineTable->Rows[RowReference.RowIndex - 1];
++    if (!CurrentFilenum)
++      CurrentFilenum = CurrentRow.File;
++
++    unsigned Flags = (DWARF2_FLAG_IS_STMT * CurrentRow.IsStmt) |
++                     (DWARF2_FLAG_BASIC_BLOCK * CurrentRow.BasicBlock) |
++                     (DWARF2_FLAG_PROLOGUE_END * CurrentRow.PrologueEnd) |
++                     (DWARF2_FLAG_EPILOGUE_BEGIN * CurrentRow.EpilogueBegin);
++
++    // Always emit is_stmt at the beginning of function fragment.
++    if (FirstInstr)
++      Flags |= DWARF2_FLAG_IS_STMT;
++    BC.Ctx->setCurrentDwarfLoc(CurrentFilenum, CurrentRow.Line, CurrentRow.Column,
++                               Flags, CurrentRow.Isa, CurrentRow.Discriminator);
++    const MCDwarfLoc &DwarfLoc = BC.Ctx->getCurrentDwarfLoc();
++    BC.Ctx->clearDwarfLocSeen();
++
++    if (!InstrLabel)
++      InstrLabel = BC.Ctx->createTempSymbol();
++
++    BC.getDwarfLineTable(FunctionUnitIndex)
++        .getMCLineSections()
++        .addLineEntry(MCDwarfLineEntry(InstrLabel, DwarfLoc),
++                      Streamer.getCurrentSectionOnly());
++
++    ResultLocs.push_back(NewLoc);
++  }
+ 
+-  return NewLoc;
++  return ResultLocs;
+ }
+ 
+ void BinaryEmitter::emitLineInfoEnd(const BinaryFunction &BF,
+diff --git a/bolt/lib/Core/BinaryFunction.cpp b/bolt/lib/Core/BinaryFunction.cpp
+index eec68ff5a5fc..83366478f8a3 100644
+--- a/bolt/lib/Core/BinaryFunction.cpp
++++ b/bolt/lib/Core/BinaryFunction.cpp
+@@ -183,7 +183,7 @@ template <typename R> static bool emptyRange(const R &Range) {
+ /// to point to this information, which is represented by a
+ /// DebugLineTableRowRef. The returned pointer is null if no debug line
+ /// information for this instruction was found.
+-static SMLoc findDebugLineInformationForInstructionAt(
++static std::vector<SMLoc> findDebugLineInformationForInstructionAt(
+     uint64_t Address, DWARFUnit *Unit,
+     const DWARFDebugLine::LineTable *LineTable) {
+   // We use the pointer in SMLoc to store an instance of DebugLineTableRowRef,
+@@ -192,24 +192,30 @@ static SMLoc findDebugLineInformationForInstructionAt(
+   static_assert(
+       sizeof(decltype(SMLoc().getPointer())) >= sizeof(DebugLineTableRowRef),
+       "Cannot fit instruction debug line information into SMLoc's pointer");
+-
++  std::vector<SMLoc> Results;
+   SMLoc NullResult = DebugLineTableRowRef::NULL_ROW.toSMLoc();
+-  uint32_t RowIndex = LineTable->lookupAddress(
++  std::vector<uint32_t> RowIndexs = LineTable->lookupAllAddresses(
+       {Address, object::SectionedAddress::UndefSection});
+-  if (RowIndex == LineTable->UnknownRowIndex)
+-    return NullResult;
++  if (RowIndexs.empty()) {
++    Results.push_back(NullResult);
++    return Results;
++  }
+ 
+-  assert(RowIndex < LineTable->Rows.size() &&
+-         "Line Table lookup returned invalid index.");
++  for (uint32_t RowIndex : RowIndexs) {
++    assert(RowIndex < LineTable->Rows.size() &&
++           "Line Table lookup returned invalid index.");
+ 
+-  decltype(SMLoc().getPointer()) Ptr;
+-  DebugLineTableRowRef *InstructionLocation =
+-      reinterpret_cast<DebugLineTableRowRef *>(&Ptr);
++    decltype(SMLoc().getPointer()) Ptr;
++    DebugLineTableRowRef *InstructionLocation =
++        reinterpret_cast<DebugLineTableRowRef *>(&Ptr);
+ 
+-  InstructionLocation->DwCompileUnitIndex = Unit->getOffset();
+-  InstructionLocation->RowIndex = RowIndex + 1;
++    InstructionLocation->DwCompileUnitIndex = Unit->getOffset();
++    InstructionLocation->RowIndex = RowIndex + 1;
++
++    Results.push_back(SMLoc::getFromPointer(Ptr));
++  }
+ 
+-  return SMLoc::getFromPointer(Ptr);
++  return Results;
+ }
+ 
+ static std::string buildSectionName(StringRef Prefix, StringRef Name,
+@@ -1497,8 +1503,10 @@ Error BinaryFunction::disassemble() {
+ 
+ add_instruction:
+     if (getDWARFLineTable()) {
+-      Instruction.setLoc(findDebugLineInformationForInstructionAt(
+-          AbsoluteInstrAddr, getDWARFUnit(), getDWARFLineTable()));
++      std::vector<SMLoc> locs = findDebugLineInformationForInstructionAt(
++              AbsoluteInstrAddr, getDWARFUnit(), getDWARFLineTable());
++      SmallVector<SMLoc, 4> smallLocs(locs.begin(), locs.end());
++      Instruction.setLocs(std::move(smallLocs));
+     }
+ 
+     // Record offset of the instruction for profile matching.
+diff --git a/llvm/include/llvm/DebugInfo/DWARF/DWARFDebugLine.h b/llvm/include/llvm/DebugInfo/DWARF/DWARFDebugLine.h
+index 79f1af034ccd..39ee678c1338 100644
+--- a/llvm/include/llvm/DebugInfo/DWARF/DWARFDebugLine.h
++++ b/llvm/include/llvm/DebugInfo/DWARF/DWARFDebugLine.h
+@@ -246,6 +246,10 @@ public:
+     /// or UnknownRowIndex if there is no such row.
+     LLVM_ABI uint32_t lookupAddress(object::SectionedAddress Address,
+                                     bool *IsApproximateLine = nullptr) const;
++    
++    /// Returns all indices of rows with file/line info for a given address.
++    /// Returns empty vector if there are no such rows.
++    LLVM_ABI std::vector<uint32_t> lookupAllAddresses(object::SectionedAddress Address) const;
+ 
+     /// Fills the Result argument with the indices of the rows that correspond
+     /// to the address range specified by \p Address and \p Size.
+@@ -319,6 +323,11 @@ public:
+ 
+     uint32_t lookupAddressImpl(object::SectionedAddress Address,
+                                bool *IsApproximateLine = nullptr) const;
++    
++                                   /// Helper method for lookupAllAddresses to find all matching addresses
++    /// in a specific sequence.
++    void lookupAllAddressesImpl(object::SectionedAddress Address,
++                                std::vector<uint32_t> &Result) const;
+ 
+     /// Fills the Result argument with the indices of the rows that correspond
+     /// to the address range specified by \p Address and \p Size.
+diff --git a/llvm/include/llvm/MC/MCInst.h b/llvm/include/llvm/MC/MCInst.h
+index b0db6b8408da..4d8f54063339 100644
+--- a/llvm/include/llvm/MC/MCInst.h
++++ b/llvm/include/llvm/MC/MCInst.h
+@@ -194,7 +194,7 @@ class MCInst {
+ 
+   SMLoc Loc;
+   SmallVector<MCOperand, 6> Operands;
+-
++  SmallVector<SMLoc, 4> Locs;
+ public:
+   MCInst() = default;
+ 
+@@ -207,6 +207,19 @@ public:
+   void setLoc(SMLoc loc) { Loc = loc; }
+   SMLoc getLoc() const { return Loc; }
+ 
++
++  size_t getNumLocs() const { return Locs.size(); }
++  void addLoc(const SMLoc &loc) { Locs.push_back(loc); }
++  void setLocs(SmallVector<SMLoc, 4>&&locs) {
++    Locs = std::move(locs);
++  }
++  const SmallVector<SMLoc, 4> &getLocs() const { return Locs; }
++  // Locs迭代器类型
++  using loc_iterator = SmallVector<SMLoc, 4>::iterator;
++  using const_loc_iterator = SmallVector<SMLoc, 4>::const_iterator;
++
++  void clearLocs() { Locs.clear(); }
++  
+   const MCOperand &getOperand(unsigned i) const { return Operands[i]; }
+   MCOperand &getOperand(unsigned i) { return Operands[i]; }
+   unsigned getNumOperands() const { return Operands.size(); }
+diff --git a/llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp b/llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp
+index 08b58669b3eb..df717827dd63 100644
+--- a/llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp
++++ b/llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp
+@@ -1369,6 +1369,49 @@ DWARFDebugLine::LineTable::lookupAddressImpl(object::SectionedAddress Address,
+   return RowIndex;
+ }
+ 
++// Add this new method to DWARFDebugLine::LineTable class
++
++std::vector<uint32_t>
++DWARFDebugLine::LineTable::lookupAllAddresses(object::SectionedAddress Address) const {
++  std::vector<uint32_t> Result;
++  
++  // Search for relocatable addresses
++  lookupAllAddressesImpl(Address, Result);
++  
++  if (!Result.empty() || Address.SectionIndex == object::SectionedAddress::UndefSection)
++    return Result;
++    
++  // Search for absolute addresses
++  Address.SectionIndex = object::SectionedAddress::UndefSection;
++  lookupAllAddressesImpl(Address, Result);
++  
++  return Result;
++}
++
++void DWARFDebugLine::LineTable::lookupAllAddressesImpl(
++    object::SectionedAddress Address, std::vector<uint32_t> &Result) const {
++  
++  // First, find an instruction sequence containing the given address.
++  DWARFDebugLine::Sequence Sequence;
++  Sequence.SectionIndex = Address.SectionIndex;
++  Sequence.HighPC = Address.Address;
++  SequenceIter It = llvm::upper_bound(Sequences, Sequence,
++                                      DWARFDebugLine::Sequence::orderByHighPC);
++  if (It == Sequences.end() || It->SectionIndex != Address.SectionIndex)
++    return;
++
++  // Find all rows with matching address in this sequence
++  RowIter FirstRow = Rows.begin() + It->FirstRowIndex;
++  RowIter LastRow = Rows.begin() + It->LastRowIndex;
++  
++  for (RowIter RowIt = FirstRow; RowIt != LastRow; ++RowIt) {
++    if (RowIt->Address.Address == Address.Address && 
++        RowIt->Address.SectionIndex == Address.SectionIndex) {
++      Result.push_back(RowIt - Rows.begin());
++    }
++  }
++}
++
+ bool DWARFDebugLine::LineTable::lookupAddressRange(
+     object::SectionedAddress Address, uint64_t Size,
+     std::vector<uint32_t> &Result,
+diff --git a/llvm/lib/MC/MCDwarf.cpp b/llvm/lib/MC/MCDwarf.cpp
+index e7c0d37e8f99..dc9183a71af9 100644
+--- a/llvm/lib/MC/MCDwarf.cpp
++++ b/llvm/lib/MC/MCDwarf.cpp
+@@ -652,8 +652,8 @@ MCDwarfLineTableHeader::tryGetFile(StringRef &Directory, StringRef &FileName,
+     trackMD5Usage(Checksum.has_value());
+     HasAnySource |= Source.has_value();
+   }
+-  if (DwarfVersion >= 5 && isRootFile(RootFile, Directory, FileName, Checksum))
+-    return 0;
++  // if (DwarfVersion >= 5 && isRootFile(RootFile, Directory, FileName, Checksum))
++  //   return 0;
+   if (FileNumber == 0) {
+     // File numbers start with 1 and/or after any file numbers
+     // allocated by inline-assembler .file directives.
+-- 
+2.33.0
+

@@ -1,0 +1,659 @@
+From e0c9c791f3a1cd67af178af24335b93c0b72ef87 Mon Sep 17 00:00:00 2001
+From: jinruiShi <1379998393@qq.com>
+Date: Sat, 24 Jan 2026 12:50:20 +0000
+Subject: [PATCH 2/2] enhence debug info
+
+---
+ bolt/include/bolt/Core/AddressMap.h           |  86 +++++++
+ bolt/include/bolt/Core/BinaryContext.h        |   2 +-
+ bolt/include/bolt/Core/BinaryFunction.h       |   6 +
+ .../bolt/Core/InstructionAnnotations.h        |  34 +++
+ bolt/lib/Core/AddressMap.cpp                  |  13 +-
+ bolt/lib/Core/BinaryEmitter.cpp               |   2 +-
+ bolt/lib/Core/BinaryFunction.cpp              | 238 +++++++++++++++++-
+ bolt/lib/Profile/BoltAddressTranslation.cpp   |   2 +-
+ llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp   |  61 ++++-
+ 9 files changed, 418 insertions(+), 26 deletions(-)
+ create mode 100644 bolt/include/bolt/Core/InstructionAnnotations.h
+
+diff --git a/bolt/include/bolt/Core/AddressMap.h b/bolt/include/bolt/Core/AddressMap.h
+index 31ed7d40ee7f..4df70cd6e124 100644
+--- a/bolt/include/bolt/Core/AddressMap.h
++++ b/bolt/include/bolt/Core/AddressMap.h
+@@ -35,10 +35,27 @@ class BinaryContext;
+ ///
+ /// The entities that can be mapped to output address are input addresses and
+ /// labels (MCSymbol). Input addresses support one-to-many mapping.
++
++// 映射点：记录输入/输出起点与各自跨度
++struct IOMappingPoint {
++  uint64_t InputAddr;     // 原始指令起始地址（绝对地址）
++  uint64_t OutputAddr;    // 输出指令起始地址（绝对地址）
++  uint32_t InputSpan;     // 原始指令大小（字节）
++  uint32_t OutputSpan;    // 输出指令大小（字节）
++
++  bool operator<(const IOMappingPoint &Other) const {
++    return InputAddr < Other.InputAddr;
++  }
++};
++
+ class AddressMap {
+   static const char *const AddressSectionName;
+   static const char *const LabelSectionName;
+ 
++  // 按 InputAddr 升序排列，不允许重叠。
++  std::vector<IOMappingPoint> Points;
++  bool Finalized{false};
++
+   /// Map multiple <input address> to <output address>.
+   using Addr2AddrMapTy = std::unordered_multimap<uint64_t, uint64_t>;
+   Addr2AddrMapTy Address2AddressMap;
+@@ -52,6 +69,75 @@ public:
+   static void emit(MCStreamer &Streamer, BinaryContext &BC);
+   static std::optional<AddressMap> parse(BinaryContext &BC);
+ 
++  void clear() {
++    Points.clear();
++    Finalized = false;
++  }
++  // 添加映射点。允许同一个输入地址多次 add（例如多份副本），由策略决定最后保留哪一个。
++  void addPoint(uint64_t InputAddr, uint64_t OutputAddr, uint32_t InputSpan, uint32_t OutputSpan) {
++    if (Finalized)
++      Finalized = false;
++    Points.push_back({InputAddr, OutputAddr, InputSpan, OutputSpan});
++  }
++  // 若存在重复输入地址，按策略去重（默认：选择输出地址最小者或热度最高者，下面先选最小者）。
++  // 然后按输入地址排序并去重。
++  void finalize() {
++    if (Finalized)
++      return;
++
++    std::sort(Points.begin(), Points.end(),
++              [](const IOMappingPoint &A, const IOMappingPoint &B) {
++                if (A.InputAddr != B.InputAddr) return A.InputAddr < B.InputAddr;
++                // 简单策略：同一输入地址，取输出地址更小的条目（可换为热度策略）
++                if (A.OutputAddr != B.OutputAddr) return A.OutputAddr < B.OutputAddr;
++                return A.InputSpan < B.InputSpan;
++              });
++
++    // 去重，保留首个（根据上面排序策略）
++    std::vector<IOMappingPoint> Unique;
++    Unique.reserve(Points.size());
++    for (const auto &P : Points) {
++      if (!Unique.empty() && Unique.back().InputAddr == P.InputAddr)
++        continue;
++      Unique.push_back(P);
++    }
++    Points.swap(Unique);
++    Finalized = true;
++  }
++
++  // 精确查找输入地址的映射点（指令起点），不存在返回空。
++  std::optional<IOMappingPoint> lookupExact(uint64_t InputAddr) const {
++    if (Points.empty()) return std::nullopt;
++    auto It = std::lower_bound(Points.begin(), Points.end(), IOMappingPoint{InputAddr,0,0,0});
++    if (It != Points.end() && It->InputAddr == InputAddr) return *It;
++    return std::nullopt;
++  }
++
++  // 近似翻译：找到最近的“起点<=In”的映射点，若 In 落在该原始指令的 InputSpan 内，
++  // 则用“起点常量偏移”进行映射，并夹到输出指令范围内。
++  // 这比“基本块线性平移”细粒度得多，且仅在“指令内部”使用线性偏移。
++  std::optional<uint64_t> translate(uint64_t InputAddr) const {
++    if (Points.empty()) return std::nullopt;
++    auto It = std::upper_bound(
++        Points.begin(), Points.end(), IOMappingPoint{InputAddr,0,0,0},
++        [](const IOMappingPoint &Key, const IOMappingPoint &Val) {
++          return Key.InputAddr < Val.InputAddr;
++        });
++    if (It == Points.begin())
++      return std::nullopt;
++    --It; // now It->InputAddr <= In
++    const auto &P = *It;
++    const uint64_t DeltaIn = InputAddr - P.InputAddr;
++    if (DeltaIn >= P.InputSpan)
++      return std::nullopt; // 落在指令之间，保守返回空（可选择退回基本块线性映射）
++
++    const uint64_t Out = P.OutputAddr + std::min<uint64_t>(DeltaIn, P.OutputSpan ? (P.OutputSpan - 1) : 0);
++    // 为避免落到输出指令之外，做一次 clamp（允许最后一个字节内）
++    return std::min<uint64_t>(Out, P.OutputAddr + (P.OutputSpan ? (P.OutputSpan - 1) : 0));
++  }
++
++  const std::vector<IOMappingPoint> &data() const { return Points; }
++
+   std::optional<uint64_t> lookup(uint64_t InputAddress) const {
+     auto It = Address2AddressMap.find(InputAddress);
+     if (It != Address2AddressMap.end())
+diff --git a/bolt/include/bolt/Core/BinaryContext.h b/bolt/include/bolt/Core/BinaryContext.h
+index 91ecf89da618..44c4cf3f5138 100644
+--- a/bolt/include/bolt/Core/BinaryContext.h
++++ b/bolt/include/bolt/Core/BinaryContext.h
+@@ -1527,7 +1527,7 @@ public:
+   }
+ 
+   void setIOAddressMap(AddressMap Map) { IOAddressMap = std::move(Map); }
+-  const AddressMap &getIOAddressMap() const {
++  AddressMap &getIOAddressMap() {
+     assert(IOAddressMap && "Address map not set yet");
+     return *IOAddressMap;
+   }
+diff --git a/bolt/include/bolt/Core/BinaryFunction.h b/bolt/include/bolt/Core/BinaryFunction.h
+index ae580520b911..919c758dfd63 100644
+--- a/bolt/include/bolt/Core/BinaryFunction.h
++++ b/bolt/include/bolt/Core/BinaryFunction.h
+@@ -34,6 +34,7 @@
+ #include "bolt/Core/FunctionLayout.h"
+ #include "bolt/Core/JumpTable.h"
+ #include "bolt/Core/MCPlus.h"
++#include "bolt/Core/InstructionAnnotations.h"
+ #include "bolt/Utils/NameResolver.h"
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/SmallString.h"
+@@ -216,6 +217,9 @@ public:
+   using cfi_iterator = CFIInstrMapType::iterator;
+   using const_cfi_iterator = CFIInstrMapType::const_iterator;
+ 
++  // 新增：InstructionAnnotations 访问器
++  InstructionAnnotations &getInstructionAnnotations() { return InstAnnotations; }
++  const InstructionAnnotations &getInstructionAnnotations() const { return InstAnnotations; }
+ private:
+   /// Current state of the function.
+   State CurrentState{State::Empty};
+@@ -281,6 +285,8 @@ private:
+   /// is a global symbol corresponding to an external entry point.
+   DenseMap<const MCSymbol *, MCSymbol *> SecondaryEntryPoints;
+ 
++  //每函数的 MCInst 注解侧表
++  InstructionAnnotations InstAnnotations;
+   /// False if the function is too complex to reconstruct its control
+   /// flow graph.
+   /// In relocation mode we still disassemble and re-assemble such functions.
+diff --git a/bolt/include/bolt/Core/InstructionAnnotations.h b/bolt/include/bolt/Core/InstructionAnnotations.h
+new file mode 100644
+index 000000000000..205b2fde23ba
+--- /dev/null
++++ b/bolt/include/bolt/Core/InstructionAnnotations.h
+@@ -0,0 +1,34 @@
++#include <cstdint>
++#include <unordered_map>
++#include "llvm/MC/MCInst.h"
++
++namespace llvm {
++
++namespace bolt {
++
++// 为每条 MCInst 存原始指令的“输入起点地址/大小”注解。
++// 实现为侧表，避免改动 MCInst 本体。
++struct InstInputAnno {
++  uint64_t InputAddr{0};
++  uint32_t InputSpan{0};
++  bool has() const { return InputSpan != 0; }
++};
++
++class InstructionAnnotations {
++  // 注意：指针作为 key 依赖 MCInst 生命周期在发射前有效
++  std::unordered_map<const MCInst*, InstInputAnno> Map;
++
++public:
++  void set(const MCInst *I, uint64_t InputAddr, uint32_t InputSpan) {
++    Map[I] = {InputAddr, InputSpan};
++  }
++  InstInputAnno get(const MCInst *I) const {
++    auto It = Map.find(I);
++    return (It == Map.end()) ? InstInputAnno{} : It->second;
++  }
++  void erase(const MCInst *I) { Map.erase(I); }
++  void clear() { Map.clear(); }
++};
++
++} // namespace bolt
++} // namespace llvm
+\ No newline at end of file
+diff --git a/bolt/lib/Core/AddressMap.cpp b/bolt/lib/Core/AddressMap.cpp
+index efa376d408db..0973d46a848a 100644
+--- a/bolt/lib/Core/AddressMap.cpp
++++ b/bolt/lib/Core/AddressMap.cpp
+@@ -51,8 +51,15 @@ void AddressMap::emit(MCStreamer &Streamer, BinaryContext &BC) {
+       Streamer.switchSection(BC.getDataSection(LabelSectionName));
+       emitLabel(Streamer, BB.getLabel());
+ 
+-      if (!BB.hasLocSyms())
++      if (!BB.hasLocSyms()) {
++        // // Fallback: emit a BB-entry mapping when no loc syms exist but BB has
++        // // a valid input offset. This ensures sparse coverage is filled.
++        // if (BB.getInputOffset() != BinaryBasicBlock::INVALID_OFFSET) {
++        //   Streamer.switchSection(BC.getDataSection(AddressSectionName));
++        //   emitAddress(Streamer, BFAddress + BB.getInputOffset(), BB.getLabel());
++        // }
+         continue;
++      }
+ 
+       Streamer.switchSection(BC.getDataSection(AddressSectionName));
+       for (auto [Offset, Symbol] : BB.getLocSyms())
+@@ -95,8 +102,8 @@ std::optional<AddressMap> AddressMap::parse(BinaryContext &BC) {
+     Parsed.Address2AddressMap.reserve(AddressMapSection->getOutputSize() /
+                                       EntrySize);
+     parseSection(*AddressMapSection, [&](uint64_t Input, uint64_t Output) {
+-      if (!Parsed.Address2AddressMap.count(Input))
+-        Parsed.Address2AddressMap.insert({Input, Output});
++      // Preserve all input-to-output mappings, including duplicates for clones.
++      Parsed.Address2AddressMap.emplace(Input, Output);
+     });
+   }
+ 
+diff --git a/bolt/lib/Core/BinaryEmitter.cpp b/bolt/lib/Core/BinaryEmitter.cpp
+index b64e2085bff3..b9a53b381118 100644
+--- a/bolt/lib/Core/BinaryEmitter.cpp
++++ b/bolt/lib/Core/BinaryEmitter.cpp
+@@ -271,7 +271,7 @@ void BinaryEmitter::emitFunctions() {
+       Streamer.setAllowAutoPadding(OriginalAllowAutoPadding);
+ 
+       if (Emitted)
+-        Function->setEmitted(/*KeepCFG=*/opts::PrintCacheMetrics);
++        Function->setEmitted(/*KeepCFG=*/true);
+     }
+   };
+ 
+diff --git a/bolt/lib/Core/BinaryFunction.cpp b/bolt/lib/Core/BinaryFunction.cpp
+index 83366478f8a3..45bb1220ef6d 100644
+--- a/bolt/lib/Core/BinaryFunction.cpp
++++ b/bolt/lib/Core/BinaryFunction.cpp
+@@ -1520,7 +1520,19 @@ add_instruction:
+       MIB->setSize(Instruction, Size);
+     }
+ 
++    // Emit instruction into the temporary map
+     addInstruction(Offset, std::move(Instruction));
++    
++    // NEW: fine-grained input->instruction annotation (record input address/size)
++    // We must fetch the just-inserted MCInst address from Instructions map.
++    if (auto It = Instructions.find(static_cast<uint32_t>(Offset));
++        It != Instructions.end()) {
++      const MCInst *InsertedMI = &It->second;
++      const uint64_t InputAddr = getAddress() + Offset;
++      const uint32_t InputSpan = static_cast<uint32_t>(Size);
++      // Directly use the accessor to store annotation on the inserted MCInst.
++      getInstructionAnnotations().set(InsertedMI, InputAddr, InputSpan);
++    }
+   }
+ 
+   for (auto [Offset, Label] : InstructionLabels) {
+@@ -2365,8 +2377,18 @@ Error BinaryFunction::buildCFG(MCPlusBuilder::AllocatorIdTy AllocatorId) {
+     IsLastInstrNop = MIB->isNoop(Instr);
+     if (!IsLastInstrNop)
+       LastInstrOffset = Offset;
++
++    const MCInst *OrigPtr = &Instr;
++
+     InsertBB->addInstruction(std::move(Instr));
+ 
++    auto NewIt = std::prev(InsertBB->end());
++    MCInst &NewMI = *NewIt;
++    {
++      auto A = getInstructionAnnotations().get(OrigPtr);
++      if (A.has())
++        getInstructionAnnotations().set(&NewMI, A.InputAddr, A.InputSpan);
++    }
+     // Add associated CFI instrs. We always add the CFI instruction that is
+     // located immediately after this instruction, since the next CFI
+     // instruction reflects the change in state caused by this instruction.
+@@ -2486,7 +2508,7 @@ Error BinaryFunction::buildCFG(MCPlusBuilder::AllocatorIdTy AllocatorId) {
+   //
+   // NB: don't clear Labels list as we may need them if we mark the function
+   //     as non-simple later in the process of discovering extra entry points.
+-  clearList(Instructions);
++  // clearList(Instructions);
+   clearList(OffsetToCFI);
+   clearList(TakenBranches);
+ 
+@@ -4435,6 +4457,28 @@ void BinaryFunction::calculateLoopInfo() {
+   }
+ }
+ 
++// 示例：在发射函数时，把每条指令的注解写入 IOAddressMap。
++// 该逻辑应插到 BOLT 的 MachineFunction/MCInst 发射路径附近：
++// 1) 从侧表取出该 MCInst 的 InputAddr/InputSpan；
++// 2) 利用“当前输出偏移”与“即将发射指令的 size”填充 OutputAddr/OutputSpan；
++// 3) 调用 BC.IOAddressMap.addPoint(...)。
++static void emitInstructionWithAnno(BinaryFunction &BF,
++                             const MCInst &MI,
++                             uint64_t CurrentOutputAddr,
++                             uint32_t EmittedSize) {
++  InstructionAnnotations &Ann = BF.getInstructionAnnotations(); // 需要在 BinaryFunction 中持有
++  auto &Map = BF.getBinaryContext().getIOAddressMap();         // 需要在 BinaryContext 提供访问
++
++  const auto A = Ann.get(&MI);
++  if (!A.has())
++    return;
++
++  Map.addPoint(/*InputAddr=*/A.InputAddr,
++               /*OutputAddr=*/CurrentOutputAddr,
++               /*InputSpan=*/A.InputSpan,
++               /*OutputSpan=*/EmittedSize);
++}
++
+ void BinaryFunction::updateOutputValues(const BOLTLinker &Linker) {
+   if (!isEmitted()) {
+     assert(!isInjected() && "injected function should be emitted");
+@@ -4556,6 +4600,70 @@ void BinaryFunction::updateOutputValues(const BOLTLinker &Linker) {
+     BB->setOutputStartAddress(0);
+     BB->setOutputEndAddress(0);
+   }
++
++  // 仅当需要地址翻译时生成（包含 BAT/调试等场景）。
++  if (requiresAddressMap()) {
++    for (FunctionFragment &FF : getLayout().fragments()) {
++      // 保证在每个 fragment 开头 we reset any fragment-local state if necessary.
++      // （若 fragment 里 block 输出地址并不连续，这个 reset 很重要）
++      for (BinaryBasicBlock *const BB : FF) {
++        LLVM_DEBUG({
++            dbgs() << "BOLT-DEBUG: first now at "
++                  << BB->getName() << " in function " << *this
++                  << " hasInstruction:" << BB->hasInstructions() << '\n';
++        });
++        // 获取该基本块的输出地址范围（[start, end)）
++        const auto [BBOutStart, BBOutEnd] = BB->getOutputAddressRange();
++
++        if (!BBOutStart || !BB->hasInstructions())
++          continue;
++
++        uint64_t CurOut = BBOutStart;
++
++        // 遍历块内每条指令
++        for (MCInst &Inst : *BB) {
++          // 跳过伪指令
++          if (BC.MIB->isPseudo(Inst))
++            continue;
++          uint64_t EmittedSize = static_cast<uint64_t>(BC.computeInstructionSize(Inst));
++
++          if (EmittedSize == 0) {
++            continue;
++          }
++
++          if (CurOut > std::numeric_limits<uint64_t>::max() - EmittedSize) {
++            break;
++          }
++
++          // 在发射之前做越界检查：如果整条指令会跨出块尾，按策略处理
++          if (CurOut + EmittedSize > BBOutEnd) {
++            // 情况 A：如果指令被截断可接受（例如填充被删），我们可以截断最后一条
++            uint64_t Remaining = BBOutEnd > CurOut ? (BBOutEnd - CurOut) : 0;
++          }
++
++          // 到此，CurOut + EmittedSize <= BBOutEnd 且不会溢出，可以安全发射打点
++          emitInstructionWithAnno(*this, Inst, CurOut, static_cast<uint32_t>(EmittedSize));
++          CurOut += EmittedSize;
++          if (CurOut > BBOutEnd) {
++            LLVM_DEBUG(dbgs() << "Fixup: CurOut exceeded BBOutEnd; clamping to BBOutEnd\n");
++            CurOut = BBOutEnd;
++            break;
++          }
++        }
++      }
++    }
++  }
++  updateState(State::Emitted);
++  releaseCFG();
++  for (FunctionFragment &FF : getLayout().fragments()) {
++      for (BinaryBasicBlock *const BB : FF) {
++        LLVM_DEBUG({
++            dbgs() << "BOLT-DEBUG: emit now at "
++                        << BB->getName() << " in function " << *this
++                        << " hasInstruction:" << BB->hasInstructions() << '\n';
++        });
++      }
++  }    
+ }
+ 
+ DebugAddressRangesVector BinaryFunction::getOutputAddressRanges() const {
+@@ -4600,25 +4708,39 @@ uint64_t BinaryFunction::translateInputToOutputAddress(uint64_t Address) const {
+   if (Address < getAddress())
+     return 0;
+ 
+-  // Check if the address is associated with an instruction that is tracked
+-  // by address translation.
+-  if (auto OutputAddress = BC.getIOAddressMap().lookup(Address))
++  // 1) Try a direct mapping for the exact input address.
++  if (auto OutputAddress = BC.getIOAddressMap().lookup(Address)){
++    LLVM_DEBUG(
++      dbgs() << "BOLT-SJR: lookup Address: " << Address << " TO output Address:"
++             << OutputAddress << "\n");
+     return *OutputAddress;
++  }
++
++  // 2) Try an approximate mapping using the IO map (e.g. nearest known point).
++  if (auto Approx = BC.getIOAddressMap().translate(Address)){
++    LLVM_DEBUG(
++      dbgs() << "BOLT-SJR: translate Address: " << Address << " TO output Address:"
++             << Approx << "\n");
++    return *Approx;
++  }
+ 
+-  // FIXME: #18950828 - we rely on relative offsets inside basic blocks to stay
+-  //        intact. Instead we can use pseudo instructions and/or annotations.
+   const uint64_t Offset = Address - getAddress();
+   const BinaryBasicBlock *BB = getBasicBlockContainingOffset(Offset);
+   if (!BB) {
+     // Special case for address immediately past the end of the function.
+     if (Offset == getSize())
+       return getOutputAddress() + getOutputSize();
+-
+     return 0;
+   }
+-
+-  return std::min(BB->getOutputAddressRange().first + Offset - BB->getOffset(),
++  
++  // 3) Final fallback: BB-level mapping (legacy behavior).
++  //    Kept for resilience if annotations are unavailable for this address.
++  uint64_t OutpuOffset = std::min(BB->getOutputAddressRange().first + Offset - BB->getOffset(),
+                   BB->getOutputAddressRange().second);
++  LLVM_DEBUG(
++      dbgs() << "BOLT-SJR: fallback Address: " << Address << " TO output Address:"
++             << OutpuOffset << "\n");
++  return OutpuOffset;
+ }
+ 
+ DebugAddressRangesVector
+@@ -4694,6 +4816,104 @@ BinaryFunction::translateInputToOutputRange(DebugAddressRange InRange) const {
+     else
+       OutRanges.emplace_back(OutLowPC, std::max(OutLowPC, OutHighPC));
+   }
++  // --BBI;
++
++
++  // // Iterate over basic blocks that are potentially covered by the input range.
++  // // The loop continues as long as InputOffset is within the overall input range
++  // // and we haven't exhausted the basic block list.
++  // for (; InputOffset < InputEndOffset && BBI != BasicBlockOffsets.end(); ++BBI) {
++  //   const BinaryBasicBlock &BB = *BBI->second;
++
++  //   // Check if the current basic block is relevant to the remaining part of the input range.
++  //   // We only care about parts of the input range that *overlap* with this basic block.
++  //   // Adjust InputOffset to the start of the overlap with the current BB.
++  //   uint64_t CurrentBlockInputLowPC = std::max(InRange.LowPC, getAddress() + BB.getOffset());
++  //   uint64_t CurrentBlockInputHighPC = std::min(InRange.HighPC, getAddress() + BB.getEndOffset());
++
++  //   // If there's no overlap with this BB, or we've processed past this BB's relevant range, continue.
++  //   if (CurrentBlockInputLowPC >= CurrentBlockInputHighPC) {
++  //       InputOffset = BB.getEndOffset(); // Advance InputOffset for the next iteration based on processed block
++  //       continue;
++  //   }
++
++  //   // Skip the block if it wasn't emitted (e.g., deleted or entirely absorbed).
++  //   // Note: If BBs are merged, the merged BB's getOutputAddressRange().first will be valid,
++  //   //       but original, deleted BBs will have it empty. Your instruction-level map handles this.
++  //   if (!BB.getOutputAddressRange().first) {
++  //       InputOffset = BB.getEndOffset(); // Advance to the end of this un-emitted block's range.
++  //       continue;
++  //   }
++
++  //   // --- CRITICAL CHANGE: Use instruction-level mapping for precision ---
++  //   // Iterate instruction by instruction within the current overlapping input range.
++  //   uint64_t CurrentInputAddr = CurrentBlockInputLowPC;
++  //   while (CurrentInputAddr < CurrentBlockInputHighPC) {
++  //     auto MaybeOutAddr = BC.getIOAddressMap().translate(CurrentInputAddr);
++
++  //     if (MaybeOutAddr) {
++  //       uint64_t OutAddr = *MaybeOutAddr;
++  //       uint64_t InstSize = 4; // Default instruction size (e.g., AArch64).
++  //                             // Ideally, BC.getIOAddressMap() or BinaryContext
++  //                             // should provide the input instruction size for CurrentInputAddr,
++  //                             // and the output instruction size for OutAddr.
++  //                             // For simplicity, we'll assume instruction sizes for iteration here.
++  //       // Assuming instruction sizes are usually fixed or can be derived.
++  //       // For more robustness, you would need to query the actual instruction size
++  //       // for CurrentInputAddr from the original binary.
++
++  //       // Determine the end of the current mapped instruction.
++  //       // This is tricky: we need the size of the *input* instruction to advance CurrentInputAddr,
++  //       // and potentially the size of the *output* instruction to determine the OutHighPC for this mapped instruction.
++  //       // For now, let's assume `InstSize` can be obtained for the input instruction.
++  //       // And the corresponding output instruction also has a size (could be different).
++  //       // For simplicity in this example, let's just add the single instruction as a point.
++  //       // A range mapping might be more complex if output instruction size differs.
++
++  //       // For now, let's map single instruction points and merge them.
++  //       // If your translate() function supports returning an output span, that would be better.
++  //       // For DWARF ranges, we often need spans. Let's try to build spans.
++  //       uint64_t TranslatedInputInstSize = 4; // Placeholder. Actual instruction size needed.
++  //       // Better: Query input instruction size from BinaryContext or BB.
++  //       // For example:
++  //       // const MCSingleInstruction *InputInst = getInstructionAt(CurrentInputAddr);
++  //       // TranslatedInputInstSize = InputInst->getSize();
++
++
++  //       // Attempt to get the size of the *output* instruction at OutAddr.
++  //       // This is usually hard without disassembling the output binary.
++  //       // A simpler approach for DWARF ranges is to map the *start* of the instruction
++  //       // and let the DWARF line table logic handle advancing PC.
++
++  //       // For now, we'll add a minimal range for the single instruction
++  //       // and try to merge with previous.
++  //       uint64_t InstOutHighPC = OutAddr + 4; // Assuming output instruction is also 4 bytes.
++  //                                           // This is an oversimplification.
++
++  //       if (!OutRanges.empty() && OutRanges.back().HighPC == OutAddr) {
++  //         OutRanges.back().HighPC = std::max(OutRanges.back().HighPC, InstOutHighPC);
++  //       } else {
++  //         OutRanges.emplace_back(OutAddr, InstOutHighPC);
++  //       }
++
++  //       // Move to the next input instruction. This requires knowing the size of the *current input* instruction.
++  //       CurrentInputAddr += TranslatedInputInstSize; // Placeholder for actual input instruction size
++  //     } else {
++  //       // Instruction at CurrentInputAddr was removed or couldn't be mapped.
++  //       // We need to advance CurrentInputAddr past this unmapped instruction.
++  //       // This requires knowing the size of the *input* instruction.
++  //       // For robustness, if instruction size cannot be determined,
++  //       // we might have to fall back to the BB-level mapping for the rest of the BB.
++  //       // For simplicity, let's assume a default size and warn.
++  //       LLVM_DEBUG(dbgs() << "BOLT-DEBUG: Instruction at input 0x" << Twine::utohexstr(CurrentInputAddr)
++  //                         << " in function " << *this << " could not be mapped.\n");
++  //       CurrentInputAddr += 4; // Advance by a default instruction size
++  //     }
++  //   }
++  //   // After processing instructions in this BB's input range,
++  //   // update InputOffset to reflect that this part of the range has been covered.
++  //   InputOffset = CurrentBlockInputHighPC - getAddress();
++  // }
+ 
+   LLVM_DEBUG({
+     dbgs() << "BOLT-DEBUG: translated address range " << InRange << " -> ";
+diff --git a/bolt/lib/Profile/BoltAddressTranslation.cpp b/bolt/lib/Profile/BoltAddressTranslation.cpp
+index 7ad4e6a2e141..13a4de875c7e 100644
+--- a/bolt/lib/Profile/BoltAddressTranslation.cpp
++++ b/bolt/lib/Profile/BoltAddressTranslation.cpp
+@@ -56,7 +56,7 @@ void BoltAddressTranslation::writeEntriesForBB(
+   // allowing it to overwrite the previously inserted key in the map.
+   Map.emplace(BBOutputOffset, BBInputOffset << 1);
+ 
+-  const auto &IOAddressMap =
++  auto &IOAddressMap =
+       BB.getFunction()->getBinaryContext().getIOAddressMap();
+ 
+   for (const auto &[InputOffset, Sym] : BB.getLocSyms()) {
+diff --git a/llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp b/llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp
+index df717827dd63..b22deb8f2712 100644
+--- a/llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp
++++ b/llvm/lib/DebugInfo/DWARF/DWARFDebugLine.cpp
+@@ -1390,8 +1390,8 @@ DWARFDebugLine::LineTable::lookupAllAddresses(object::SectionedAddress Address)
+ 
+ void DWARFDebugLine::LineTable::lookupAllAddressesImpl(
+     object::SectionedAddress Address, std::vector<uint32_t> &Result) const {
+-  
+-  // First, find an instruction sequence containing the given address.
++
++  // 1. 定位 Sequence (保持不变)
+   DWARFDebugLine::Sequence Sequence;
+   Sequence.SectionIndex = Address.SectionIndex;
+   Sequence.HighPC = Address.Address;
+@@ -1400,18 +1400,57 @@ void DWARFDebugLine::LineTable::lookupAllAddressesImpl(
+   if (It == Sequences.end() || It->SectionIndex != Address.SectionIndex)
+     return;
+ 
+-  // Find all rows with matching address in this sequence
+-  RowIter FirstRow = Rows.begin() + It->FirstRowIndex;
+-  RowIter LastRow = Rows.begin() + It->LastRowIndex;
+-  
+-  for (RowIter RowIt = FirstRow; RowIt != LastRow; ++RowIt) {
+-    if (RowIt->Address.Address == Address.Address && 
+-        RowIt->Address.SectionIndex == Address.SectionIndex) {
+-      Result.push_back(RowIt - Rows.begin());
+-    }
++  // 2. 使用 findRowInSeq 找到“最符合”的一个基准行
++  // 注意：如果是精确地址匹配，findRowInSeq 通常返回的是该地址序列的【最后一个】
++  uint32_t RowIndex = findRowInSeq(*It, Address);
++  if (RowIndex == UnknownRowIndex)
++    return;
++
++  // 3. 【新逻辑】确定要遍历的候选行范围 [FirstCandidate, LastCandidate]
++  uint32_t FirstCandidate = RowIndex;
++  uint32_t LastCandidate = RowIndex;
++
++  // 检查是否是精确地址匹配 (Address == Row.Address)
++  if (Rows[RowIndex].Address.Address == Address.Address) {
++      // 如果是精确匹配，说明可能存在多个同地址的行。
++      // 因为 findRowInSeq 返回的是最后一个，我们需要向前倒推，找到该地址的第一个行。
++      while (FirstCandidate > It->FirstRowIndex && 
++             Rows[FirstCandidate - 1].Address.Address == Address.Address) {
++          FirstCandidate--;
++      }
++      // LastCandidate 保持为 RowIndex (即最后一个匹配项)
++  } 
++  // else: 如果是区间匹配 (Address > Row.Address)，说明指令在某一行中间，
++  // 这种情况下逻辑上只有一行覆盖该地址，FirstCandidate == LastCandidate。
++
++  // 4. 【循环处理】对范围内的每一行，单独应用 "Line 0 回溯" 逻辑
++  for (uint32_t CurrentIdx = FirstCandidate; CurrentIdx <= LastCandidate; ++CurrentIdx) {
++      
++      uint32_t ApproxRowIndex = CurrentIdx;
++
++      // === Line 0 回溯逻辑 (针对当前遍历到的这一行) ===
++      // 这里的逻辑是你之前定义的：如果是Line 0，就往前找非0的
++      while (ApproxRowIndex >= It->FirstRowIndex && Rows[ApproxRowIndex].Line == 0) {
++          if (ApproxRowIndex == It->FirstRowIndex) {
++              // 已经退无可退，只能接受原始结果
++              ApproxRowIndex = CurrentIdx; 
++              break;
++          }
++          ApproxRowIndex--;
++      }
++      
++      // === 插入结果 ===
++      // 如果回溯成功找到了非0行，优先加入非0行
++      if (Rows[ApproxRowIndex].Line != 0) {
++          Result.push_back(ApproxRowIndex);
++      } else {
++          // 如果回溯失败（全是0），这里插入原始找到的行(CurrentIdx)
++          Result.push_back(CurrentIdx);
++      }
+   }
+ }
+ 
++
+ bool DWARFDebugLine::LineTable::lookupAddressRange(
+     object::SectionedAddress Address, uint64_t Size,
+     std::vector<uint32_t> &Result,
+-- 
+2.33.0
+
