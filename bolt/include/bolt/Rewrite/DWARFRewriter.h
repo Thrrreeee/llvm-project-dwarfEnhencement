@@ -16,6 +16,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/CodeGen/DIE.h"
 #include "llvm/MC/MCContext.h"
+#include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <cstdint>
 #include <memory>
@@ -45,6 +46,8 @@ private:
   BinaryContext &BC;
 
   std::mutex DWARFRewriterMutex;
+
+  std::unique_ptr<llvm::ThreadPoolInterface> DebugInfoThreadPool;
 
   /// Stores and serializes information that will be put into the
   /// .debug_ranges DWARF section.
@@ -100,6 +103,8 @@ private:
   /// Used to track last CU offset for GDB Index.
   uint32_t CUOffset{0};
 
+  llvm::ThreadPoolInterface &
+  getOrCreateDebugInfoThreadPool(unsigned ThreadCount);
   /// Update debug info for all DIEs in \p Unit.
   void updateUnitDebugInfo(DWARFUnit &Unit, DIEBuilder &DIEBldr,
                            DebugLocWriter &DebugLocWriter,
@@ -118,11 +123,11 @@ private:
   ///    attribute.
   void updateDWARFObjectAddressRanges(
       DWARFUnit &Unit, DIEBuilder &DIEBldr, DIE &Die,
-      uint64_t DebugRangesOffset,
+      uint64_t DebugRangesOffset, DebugAddrWriter &AddressWriter,
       std::optional<uint64_t> RangesBase = std::nullopt);
 
   std::unique_ptr<DebugBufferVector>
-  makeFinalLocListsSection(DWARFVersion Version);
+  makeFinalLocListsSection(DWARFVersion Version, std::vector<uint64_t> CUOrder);
 
   /// Finalize type sections in the main binary.
   CUOffsetMap finalizeTypeSections(DIEBuilder &DIEBlder, DIEStreamer &Streamer,
@@ -135,11 +140,11 @@ private:
                             DebugAddrWriter &FinalAddrWriter);
 
   /// Finalize debug sections in the main binary.
-  void finalizeDebugSections(DIEBuilder &DIEBlder,
-                             DWARF5AcceleratorTable &DebugNamesTable,
-                             DIEStreamer &Streamer, raw_svector_ostream &ObjOS,
-                             CUOffsetMap &CUMap,
-                             DebugAddrWriter &FinalAddrWriter);
+  void finalizeDebugSections(DIEBuilder &DIEBlder, DIEStreamer &Streamer,
+                             raw_svector_ostream &ObjOS, CUOffsetMap &CUMap);
+  void flushDebugLocAndRangeSections(DebugAddrWriter &FinalAddrWriter,
+                                     std::vector<uint64_t> CUOrder);
+  void flushDebugStringSections(DWARF5AcceleratorTable &DebugNamesTable);
 
   /// Patches the binary for DWARF address ranges (e.g. in functions and lexical
   /// blocks) to be updated.
@@ -168,7 +173,7 @@ private:
   void convertToRangesPatchDebugInfo(
       DWARFUnit &Unit, DIEBuilder &DIEBldr, DIE &Die,
       uint64_t RangesSectionOffset, DIEValue &LowPCAttrInfo,
-      DIEValue &HighPCAttrInfo,
+      DIEValue &HighPCAttrInfo, DebugAddrWriter &AddressWriter,
       std::optional<uint64_t> RangesBase = std::nullopt);
 
 public:

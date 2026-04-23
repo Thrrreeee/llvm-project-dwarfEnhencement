@@ -86,7 +86,8 @@ static void addStringHelper(DebugStrOffsetsWriter &StrOffstsWriter,
 std::string DIEBuilder::updateDWONameCompDir(
     DebugStrOffsetsWriter &StrOffstsWriter, DebugStrWriter &StrWriter,
     DWARFUnit &SkeletonCU, std::optional<StringRef> DwarfOutputPath,
-    std::optional<StringRef> DWONameToUse) {
+    std::optional<StringRef> DWONameToUse,
+    std::unordered_map<uint64_t, std::string> &DWOIDToName) {
   DIE &UnitDIE = *getUnitDIEbyUnit(SkeletonCU);
   DIEValue DWONameAttrInfo = UnitDIE.findAttribute(dwarf::DW_AT_dwo_name);
   if (!DWONameAttrInfo)
@@ -96,8 +97,12 @@ std::string DIEBuilder::updateDWONameCompDir(
   std::string ObjectName;
   if (DWONameToUse)
     ObjectName = *DWONameToUse;
-  else
-    ObjectName = getDWOName(SkeletonCU, NameToIndexMap, DwarfOutputPath);
+  else {
+    std::optional<uint64_t> DWOId = SkeletonCU.getDWOId();
+    auto NameIt = DWOIDToName.find(*DWOId);
+    assert(NameIt != DWOIDToName.end() && "DWO ID not found in name map");
+    ObjectName = NameIt->second;
+  }
   addStringHelper(StrOffstsWriter, StrWriter, *this, UnitDIE, SkeletonCU,
                   DWONameAttrInfo, ObjectName);
 
@@ -116,10 +121,11 @@ std::string DIEBuilder::updateDWONameCompDir(
 void DIEBuilder::updateDWONameCompDirForTypes(
     DebugStrOffsetsWriter &StrOffstsWriter, DebugStrWriter &StrWriter,
     DWARFUnit &Unit, std::optional<StringRef> DwarfOutputPath,
-    const StringRef DWOName) {
+    const StringRef DWOName,
+    std::unordered_map<uint64_t, std::string> &DWOIDToName) {
   for (DWARFUnit *DU : getState().DWARF5TUVector)
     updateDWONameCompDir(StrOffstsWriter, StrWriter, *DU, DwarfOutputPath,
-                         DWOName);
+                         DWOName, DWOIDToName);
   if (StrOffstsWriter.isStrOffsetsSectionModified())
     StrOffstsWriter.finalizeSection(Unit, *this);
 }
@@ -356,9 +362,8 @@ void DIEBuilder::buildCompileUnits(const std::vector<DWARFUnit *> &CUs) {
 }
 
 void DIEBuilder::buildDWOUnit(DWARFUnit &U) {
-  BuilderState.release();
-  BuilderState = std::make_unique<State>();
-  buildTypeUnits(nullptr, false);
+  if (!BuilderState)
+    BuilderState = std::make_unique<State>();
   getState().Type = ProcessingType::CUs;
   registerUnit(U, false);
   constructFromUnit(U);
@@ -514,7 +519,6 @@ void DIEBuilder::finish() {
       break;
     finalizeCU(*CU, TypeUnitStartOffset);
   }
-
   for (DWARFUnit *CU : getState().DUList) {
     // Skipping DWARF4 types.
     if (CU->getVersion() < 5 && CU->isTypeUnit())
@@ -581,7 +585,7 @@ DWARFDie DIEBuilder::resolveDIEReference(
   if ((RefCU =
            getUnitForOffset(*this, *DwarfContext, TmpRefOffset, AttrSpec))) {
     /// Trying to add to current working set in case it's cross CU reference.
-    if (!registerUnit(*RefCU, true))
+    if (!registerUnit(*RefCU, false))
       return DWARFDie();
     DWARFDataExtractor DebugInfoData = RefCU->getDebugInfoExtractor();
     if (DwarfDebugInfoEntry.extractFast(*RefCU, &TmpRefOffset, DebugInfoData,
@@ -989,6 +993,25 @@ void DIEBuilder::generateUnitAbbrevs(DIE *Die) {
 
   for (auto &Child : Die->children()) {
     generateUnitAbbrevs(&Child);
+  }
+}
+
+void DIEBuilder::syncAbbrevTableFrom(const DIEBuilder &SrcBuilder) {
+  Abbreviations.clear();
+  AbbreviationsSet.clear();
+  Abbreviations.reserve(SrcBuilder.Abbreviations.size());
+  for (const auto &SrcAbbrev : SrcBuilder.Abbreviations) {
+    auto Copy = std::make_unique<DIEAbbrev>(SrcAbbrev->getTag(),
+                                            SrcAbbrev->hasChildren());
+    for (const auto &Attr : SrcAbbrev->getData())
+      Copy->AddAttribute(Attr.getAttribute(), Attr.getForm());
+    Copy->setNumber(SrcAbbrev->getNumber());
+    FoldingSetNodeID ID;
+    Copy->Profile(ID);
+    void *InsertToken;
+    if (!AbbreviationsSet.FindNodeOrInsertPos(ID, InsertToken))
+      AbbreviationsSet.InsertNode(Copy.get(), InsertToken);
+    Abbreviations.push_back(std::move(Copy));
   }
 }
 
