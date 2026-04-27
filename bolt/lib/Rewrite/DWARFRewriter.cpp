@@ -661,10 +661,7 @@ static CUPartitionVector partitionCUs(DWARFContext &DwCtx) {
       return nullptr;
     return *--It;
   };
-  // Track CUs that contain DW_FORM_ref_addr (referrers) and all CUs that are
-  // either referrers or ref targets.
-  SmallVector<DWARFUnit *> CrossRefCUs;
-  DenseSet<DWARFUnit *> ReferrerSet;
+
   DenseSet<DWARFUnit *> CrossRefSet;
   EquivalenceClasses<DWARFUnit *> EC;
   for (DWARFUnit *CU : AllCUs) {
@@ -681,6 +678,7 @@ static CUPartitionVector partitionCUs(DWARFContext &DwCtx) {
     if (RefAddrAbbrevs.empty())
       continue;
     bool HasCrossRef = false;
+    // Track CUs involved in cross-CU references via DW_FORM_ref_addr.
     for (const DWARFDebugInfoEntry &Entry : CU->dies()) {
       DWARFDie Die(CU, &Entry);
       const DWARFAbbreviationDeclaration *Abbrev =
@@ -708,101 +706,50 @@ static CUPartitionVector partitionCUs(DWARFContext &DwCtx) {
     if (!HasCrossRef)
       continue;
 
-    // Ensure standalone referrers (e.g. malformed refs) still end up in their
-    // own singleton equivalence class.
     if (CrossRefSet.insert(CU).second)
       EC.insert(CU);
-
-    if (ReferrerSet.insert(CU).second)
-      CrossRefCUs.push_back(CU);
-  }
-  CUPartitionVector Vec;
-  // Decide per-equivalence-class ordering policy.
-  // - DWARF4 classes: keep referrers first (needed for backward-ref tests).
-  // - DWARF5+ classes: keep original CU order to preserve stable abbrev/DIE
-  //   layout expected by existing tests.
-  DenseMap<DWARFUnit *, bool> LeaderHasDWARF4;
-  for (DWARFUnit *CU : AllCUs) {
-    if (!CrossRefSet.count(CU))
-      continue;
-    DWARFUnit *Leader = EC.getLeaderValue(CU);
-    LeaderHasDWARF4[Leader] |= (CU->getVersion() <= 4);
   }
 
-  // Snapshot membership once so we don't need multiple near-identical passes
-  // that keep checking CrossRefSet / Added.
-  DenseMap<DWARFUnit *, SmallVector<DWARFUnit *, 8>> MembersByLeader;
-  DenseMap<DWARFUnit *, SmallVector<DWARFUnit *, 4>> ReferrersByLeader;
+  DenseMap<DWARFUnit *, std::vector<DWARFUnit *>> MembersByLeader;
   for (DWARFUnit *CU : AllCUs) {
     if (!CrossRefSet.count(CU))
       continue;
     MembersByLeader[EC.getLeaderValue(CU)].push_back(CU);
   }
-  for (DWARFUnit *CU : CrossRefCUs)
-    ReferrersByLeader[EC.getLeaderValue(CU)].push_back(CU);
 
-  // Establish bucket order for each policy.
-  SmallVector<DWARFUnit *, 0> DWARF5LeadersInOrder;
-  DenseSet<DWARFUnit *> SeenDWARF5Leaders;
+  // // Sort members within each bucket by CU offset.
+  // auto SortByOffset = [](DWARFUnit *A, DWARFUnit *B) {
+  //   return A->getOffset() < B->getOffset();
+  // };
+  // for (auto &[Leader, Members] : MembersByLeader)
+  //   llvm::sort(Members, SortByOffset);
+
+   std::vector<DWARFUnit *> Leaders;
+  Leaders.reserve(MembersByLeader.size());
+  for (auto &[Leader, Members] : MembersByLeader)
+    Leaders.push_back(Leader);
+  llvm::sort(Leaders, [&](DWARFUnit *A, DWARFUnit *B) {
+    return MembersByLeader[A].front()->getOffset() <
+           MembersByLeader[B].front()->getOffset();
+  });
+
+  // Emit cross-ref buckets, then singleton non-cross-ref CUs.
+  CUPartitionVector Vec;
+  for (DWARFUnit *Leader : Leaders)
+    Vec.push_back(std::move(MembersByLeader[Leader]));
+  std::vector<DWARFUnit *> PendingSingletons;
   for (DWARFUnit *CU : AllCUs) {
-    if (!CrossRefSet.count(CU))
-      continue;
-    DWARFUnit *Leader = EC.getLeaderValue(CU);
-    if (LeaderHasDWARF4.lookup(Leader))
-      continue;
-    if (SeenDWARF5Leaders.insert(Leader).second)
-      DWARF5LeadersInOrder.push_back(Leader);
+      if (!CrossRefSet.count(CU)) {
+          PendingSingletons.push_back(CU);
+          if (PendingSingletons.size() >=  opts::BatchSize) {
+              Vec.push_back(std::move(PendingSingletons));
+              PendingSingletons = {};
+          }
+      }
   }
-  SmallVector<DWARFUnit *, 0> DWARF4LeadersInOrder;
-  DenseSet<DWARFUnit *> SeenDWARF4Leaders;
-  for (DWARFUnit *CU : CrossRefCUs) {
-    DWARFUnit *Leader = EC.getLeaderValue(CU);
-    if (!LeaderHasDWARF4.lookup(Leader))
-      continue;
-    if (SeenDWARF4Leaders.insert(Leader).second)
-      DWARF4LeadersInOrder.push_back(Leader);
-  }
+  if (!PendingSingletons.empty())
+      Vec.push_back(std::move(PendingSingletons));
 
-  // Emit buckets.
-  auto appendBucketForLeader = [&](DWARFUnit *Leader) {
-    auto MemIt = MembersByLeader.find(Leader);
-    assert(MemIt != MembersByLeader.end() &&
-           "Cross-ref leader without members");
-
-    DWARFUnitVec Bucket;
-    const bool HasDWARF4 = LeaderHasDWARF4.lookup(Leader);
-    if (!HasDWARF4) {
-      Bucket.assign(MemIt->second.begin(), MemIt->second.end());
-      Vec.push_back(std::move(Bucket));
-      return;
-    }
-
-    // DWARF4+: referrers first (discovery order), then remaining members
-    // (targets-only) in original CU order.
-    auto RefIt = ReferrersByLeader.find(Leader);
-    Bucket.reserve(MemIt->second.size());
-    if (RefIt != ReferrersByLeader.end())
-      Bucket.insert(Bucket.end(), RefIt->second.begin(), RefIt->second.end());
-    for (DWARFUnit *CU : MemIt->second)
-      if (!ReferrerSet.count(CU))
-        Bucket.push_back(CU);
-    assert(Bucket.size() == MemIt->second.size() &&
-           "Bucket ordering lost or duplicated members");
-    Vec.push_back(std::move(Bucket));
-  };
-
-  // Keep the historical policy split: all DWARF5+ cross-ref buckets first,
-  // then DWARF4 buckets.
-  for (DWARFUnit *Leader : DWARF5LeadersInOrder)
-    appendBucketForLeader(Leader);
-  for (DWARFUnit *Leader : DWARF4LeadersInOrder)
-    appendBucketForLeader(Leader);
-
-  // Finally, append non-cross-ref CUs as singleton buckets in original CU
-  // order.
-  for (DWARFUnit *CU : AllCUs)
-    if (!CrossRefSet.count(CU))
-      Vec.push_back({CU});
   return Vec;
 }
 
@@ -1225,7 +1172,6 @@ void DWARFRewriter::updateDebugInfo() {
   const uint64_t InitialRngListsOffset =
       RangeListsSectionWriter ? RangeListsSectionWriter->getSectionOffset() : 0;
   std::vector<BucketDIEBuilder> BucketDIEBlders(PartVec.size());
-  threadTimer.startTimer();
   std::mutex MergeQueueMutex;
   std::condition_variable MergeQueueCV;
   const size_t TotalTasks = PartVec.size();
@@ -1329,7 +1275,6 @@ void DWARFRewriter::updateDebugInfo() {
   }
 
   ThreadPool.wait();
-  threadTimer.stopTimer();
 
   flushDebugLocAndRangeSections(*FinalAddrWriter, Accum.LocListCUOrder);
   flushDebugStringSections(DebugNamesTable);
