@@ -140,11 +140,12 @@ private:
                             DebugAddrWriter &FinalAddrWriter);
 
   /// Finalize debug sections in the main binary.
-  void finalizeDebugSections(DIEBuilder &DIEBlder, DIEStreamer &Streamer,
-                             raw_svector_ostream &ObjOS, CUOffsetMap &CUMap);
-  void flushDebugLocAndRangeSections(DebugAddrWriter &FinalAddrWriter,
-                                     std::vector<uint64_t> CUOrder);
-  void flushDebugStringSections(DWARF5AcceleratorTable &DebugNamesTable);
+  void finalizeDebugSections(DIEBuilder &DIEBlder,
+                             DWARF5AcceleratorTable &DebugNamesTable,
+                             DIEStreamer &Streamer, raw_svector_ostream &ObjOS,
+                             CUOffsetMap &CUMap,
+                             DebugAddrWriter &FinalAddrWriter,
+                             std::vector<uint64_t> SortedCU);
 
   /// Patches the binary for DWARF address ranges (e.g. in functions and lexical
   /// blocks) to be updated.

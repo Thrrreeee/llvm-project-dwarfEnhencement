@@ -567,13 +567,9 @@ void DWARF5AcceleratorTable::finalize() {
                                : std::numeric_limits<unsigned>::max();
         };
         return std::make_tuple(LHS->getDieOffset(), GetCompileUnitKey(LHS),
-                               GetTypeUnitKey(LHS), LHS->getDieTag(),
-                               LHS->isParentRoot(),
-                               LHS->getParentDieOffset()) <
+                               GetTypeUnitKey(LHS)) <
                std::make_tuple(RHS->getDieOffset(), GetCompileUnitKey(RHS),
-                               GetTypeUnitKey(RHS), RHS->getDieTag(),
-                               RHS->isParentRoot(),
-                               RHS->getParentDieOffset());
+                               GetTypeUnitKey(RHS));
       });
   }
 

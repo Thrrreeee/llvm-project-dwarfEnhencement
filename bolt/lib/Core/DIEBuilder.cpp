@@ -274,6 +274,11 @@ static unsigned int getCUNum(DWARFContext *DwarfContext, bool IsDWO) {
 
 void DIEBuilder::buildTypeUnits(DebugStrOffsetsWriter *StrOffsetWriter,
                                 const bool Init) {
+  static std::mutex DWOTypeUnitsBuildMutex;
+  std::unique_lock<std::mutex> DWOTypeUnitsBuildLock(DWOTypeUnitsBuildMutex,
+                                                     std::defer_lock);
+  if (isDWO())
+    DWOTypeUnitsBuildLock.lock();
   if (Init)
     BuilderState.reset(new State());
 
@@ -362,8 +367,9 @@ void DIEBuilder::buildCompileUnits(const std::vector<DWARFUnit *> &CUs) {
 }
 
 void DIEBuilder::buildDWOUnit(DWARFUnit &U) {
-  if (!BuilderState)
-    BuilderState = std::make_unique<State>();
+  BuilderState.release();
+  BuilderState = std::make_unique<State>();
+  buildTypeUnits(nullptr, false);
   getState().Type = ProcessingType::CUs;
   registerUnit(U, false);
   constructFromUnit(U);
