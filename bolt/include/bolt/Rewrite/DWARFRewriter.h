@@ -41,6 +41,23 @@ public:
     uint64_t TypeHash;
     uint64_t TypeDIERelativeOffset;
   };
+  struct BucketMergeAccum {
+    uint64_t CumulativeRngListsSize = 0;
+    uint64_t LoclistsRunningOffset = 0;
+    uint64_t LegacyLocRunningOffset = 0;
+    std::vector<uint64_t> LocListCUOrder;
+  };
+  struct BucketLocalWriter {
+    std::unique_ptr<DebugRangeListsSectionWriter> RngListsWriter;
+    std::unique_ptr<DebugRangesSectionWriter> LegacyRangesWriter;
+
+    /// Release both writers at once. Called when the bucket has been fully
+    /// merged into the global DWARF section writers.
+    void clear() {
+      RngListsWriter.reset();
+      LegacyRangesWriter.reset();
+    }
+  };
 
 private:
   BinaryContext &BC;
@@ -128,14 +145,33 @@ private:
 
   std::unique_ptr<DebugBufferVector>
   makeFinalLocListsSection(DWARFVersion Version, std::vector<uint64_t> CUOrder);
-
+  void createRangeLocListAndAddressWriters();
   /// Finalize type sections in the main binary.
   CUOffsetMap finalizeTypeSections(DIEBuilder &DIEBlder, DIEStreamer &Streamer,
                                    GDBIndex &GDBIndexSection);
+  
+  /// Finalize str section in the dwo
+  void finalizeSkeletonAndStrOffsets(
+      DIEBuilder &PartDIEBlder,
+      const std::optional<std::string> &DwarfOutputPath,
+      std::unordered_map<uint64_t, std::string> DWOToNameMap);
+  
+  /// Merge Bucket locs section and ranges section result
+  void mergePerBucketLocsAndRanges(
+      DIEBuilder &PartDIEBlder, ArrayRef<DWARFUnit *> SortedCUs,
+      const std::optional<std::string> &DwarfOutputPath,
+      std::unordered_map<uint64_t, std::string> DWOToNameMap,
+      uint64_t DeltaDWARF5, BucketMergeAccum &Accum);
+
+  /// append buffers to RangeListsSectionWriter/LegacyRangesSectionWriter
+  void appendBucketRangeBuffers(DIEBuilder &PartDIEBlder,
+                                ArrayRef<DWARFUnit *> SortedCUs,
+                                BucketLocalWriter &LocalWriters,
+                                BucketMergeAccum &Accum);
 
   /// Process and write out CUs that are passed in.
-  void finalizeCompileUnits(DIEBuilder &DIEBlder, DIEStreamer &Streamer,
-                            CUOffsetMap &CUMap,
+  void finalizeCompileUnits(DIEBuilder &DIEBlder, DIEBuilder &MainDIEBlder,
+                            DIEStreamer &Streamer, CUOffsetMap &CUMap,
                             const std::list<DWARFUnit *> &CUs,
                             DebugAddrWriter &FinalAddrWriter);
 
