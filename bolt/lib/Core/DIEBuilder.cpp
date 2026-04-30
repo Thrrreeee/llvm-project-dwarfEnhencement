@@ -42,29 +42,6 @@ extern cl::opt<unsigned> Verbosity;
 namespace llvm {
 namespace bolt {
 
-/// Returns DWO Name to be used to update DW_AT_dwo_name/DW_AT_GNU_dwo_name
-/// either in CU or TU unit die. Handles case where user specifies output DWO
-/// directory, and there are duplicate names. Assumes DWO ID is unique.
-static std::string
-getDWOName(llvm::DWARFUnit &CU,
-           std::unordered_map<std::string, uint32_t> &NameToIndexMap,
-           std::optional<StringRef> &DwarfOutputPath) {
-  assert(CU.getDWOId() && "DWO ID not found.");
-  std::string DWOName = dwarf::toString(
-      CU.getUnitDIE().find({dwarf::DW_AT_dwo_name, dwarf::DW_AT_GNU_dwo_name}),
-      "");
-  assert(!DWOName.empty() &&
-         "DW_AT_dwo_name/DW_AT_GNU_dwo_name does not exist.");
-  if (DwarfOutputPath) {
-    DWOName = std::string(sys::path::filename(DWOName));
-    uint32_t &Index = NameToIndexMap[DWOName];
-    DWOName.append(std::to_string(Index));
-    ++Index;
-  }
-  DWOName.append(".dwo");
-  return DWOName;
-}
-
 /// Adds a \p Str to .debug_str section.
 /// Uses \p AttrInfoVal to either update entry in a DIE for legacy DWARF using
 /// \p DebugInfoPatcher, or for DWARF5 update an index in .debug_str_offsets
