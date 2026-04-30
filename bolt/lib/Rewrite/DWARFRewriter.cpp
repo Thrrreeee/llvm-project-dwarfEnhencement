@@ -254,12 +254,12 @@ private:
     // DWARF v5 reorders the address size and adds a unit type.
     if (Version >= 5) {
       Asm.emitInt8(UT);
-      Asm.emitInt8(Asm.MAI->getCodePointerSize());
+      Asm.emitInt8(Asm.MAI.getCodePointerSize());
     }
 
     Asm.emitInt32(0);
     if (Version <= 4) {
-      Asm.emitInt8(Asm.MAI->getCodePointerSize());
+      Asm.emitInt8(Asm.MAI.getCodePointerSize());
     }
   }
 
@@ -1018,8 +1018,13 @@ void DWARFRewriter::updateDebugInfo() {
                                          AddressWriter);
     updateUnitDebugInfo(SplitCU, DWODIEBuilder, DebugLocDWoWriter,
                         TempRangesSectionWriter, AddressWriter);
-    DebugLocDWoWriter.finalize(DWODIEBuilder,
-                               *DWODIEBuilder.getUnitDIEbyUnit(SplitCU));
+    DIE *UnitDIE = DWODIEBuilder.getUnitDIEbyUnit(SplitCU);
+    if (!UnitDIE) {
+      errs() << "BOLT-WARNING: failed to construct DIE for split CU "
+             << Twine::utohexstr(*Unit.getDWOId()) << "\n";
+      return;
+    }
+    DebugLocDWoWriter.finalize(DWODIEBuilder, *UnitDIE);
     if (Unit.getVersion() >= 5)
       TempRangesSectionWriter.finalizeSection();
     emitDWOBuilder(DWOName, DWODIEBuilder, *this, SplitCU, Unit,
@@ -2163,6 +2168,8 @@ std::optional<StringRef> updateDebugData(
                           uint64_t &DWPOffset) -> StringRef {
     if (DWOEntry) {
       DWOSectionContribution *DWOContrubution = DWOEntry->getContribution(Sec);
+      if (!DWOContrubution)
+        return OutData;
       DWPOffset = DWOContrubution->getOffset();
       OutData = OutData.substr(DWPOffset, DWOContrubution->getLength());
     }
