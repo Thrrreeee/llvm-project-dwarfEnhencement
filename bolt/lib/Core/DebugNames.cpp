@@ -66,7 +66,6 @@ DWARF5AcceleratorTable::DWARF5AcceleratorTable(
   }
 }
 
-// 
 void DWARF5AcceleratorTable::preAllocateUnits(DWARFContext &DwCtx) {
   // Collect all DWO IDs in deterministic order (by CU offset in .debug_info).
   // This is single-threaded, called before parallel process.
