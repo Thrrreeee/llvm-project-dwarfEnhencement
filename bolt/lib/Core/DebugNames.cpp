@@ -87,19 +87,8 @@ void DWARF5AcceleratorTable::preAllocateUnits(DWARFContext &DwCtx) {
     if (!DWOCU || !*DWOCU)
       continue;
     DWARFContext &DWOCtx = (*DWOCU)->getContext();
-    // check dwo_info_section_units for DWARF5 type units in DWO.
-    for (const auto &TU : DWOCtx.dwo_info_section_units()) {
-      if (!TU->isTypeUnit())
-        continue;
-      const uint64_t TUHash = cast<DWARFTypeUnit>(TU.get())->getTypeHash();
-      // Only insert on first encounter — preserves discovery order.
-      if (!TUHashToIndexMap.count(TUHash)) {
-        TUHashToIndexMap.insert({TUHash, ForeignTUList.size()});
-        ForeignTUList.push_back(TUHash);
-      }
-    }
     // check dwo_types_section_units for DWARF4 type units in DWO.
-    for (const auto &TU : DWOCtx.dwo_types_section_units()) {
+    for (const auto &TU : DWOCtx.dwo_units()) {
       if (!TU->isTypeUnit())
         continue;
       const uint64_t TUHash = cast<DWARFTypeUnit>(TU.get())->getTypeHash();

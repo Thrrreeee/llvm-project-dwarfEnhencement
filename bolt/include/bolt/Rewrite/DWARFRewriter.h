@@ -41,21 +41,21 @@ public:
     uint64_t TypeHash;
     uint64_t TypeDIERelativeOffset;
   };
-  struct BucketMergeAccum {
-    uint64_t CumulativeRngListsSize = 0;
-    uint64_t LoclistsRunningOffset = 0;
-    uint64_t LegacyLocRunningOffset = 0;
+  struct BucketLocAccum {
+    uint64_t LoclistsOffset = 0;
+    uint64_t LegacyLocOffset = 0;
     std::vector<uint64_t> LocListCUOrder;
   };
   struct BucketLocalWriter {
     std::unique_ptr<DebugRangeListsSectionWriter> RngListsWriter;
     std::unique_ptr<DebugRangesSectionWriter> LegacyRangesWriter;
 
-    /// Release both writers at once. Called when the bucket has been fully
-    /// merged into the global DWARF section writers.
+    /// Release whichever writer was initialized.
     void clear() {
-      RngListsWriter.reset();
-      LegacyRangesWriter.reset();
+      if (RngListsWriter)
+        RngListsWriter.reset();
+      if (LegacyRangesWriter)
+        LegacyRangesWriter.reset();
     }
   };
 
@@ -149,25 +149,24 @@ private:
   /// Finalize type sections in the main binary.
   CUOffsetMap finalizeTypeSections(DIEBuilder &DIEBlder, DIEStreamer &Streamer,
                                    GDBIndex &GDBIndexSection);
-  
+
   /// Finalize str section in the dwo
-  void finalizeSkeletonAndStrOffsets(
+  void finalizeSkeletonAndStrSection(
       DIEBuilder &PartDIEBlder,
       const std::optional<std::string> &DwarfOutputPath,
-      std::unordered_map<uint64_t, std::string> DWOToNameMap);
-  
+      std::unordered_map<uint64_t, std::string> DWOToNameMap, DWARFUnit &CU);
+
   /// Merge Bucket locs section and ranges section result
   void mergePerBucketLocsAndRanges(
-      DIEBuilder &PartDIEBlder, ArrayRef<DWARFUnit *> SortedCUs,
+      DIEBuilder &PartDIEBlder, std::vector<DWARFUnit *> SortedCUs,
       const std::optional<std::string> &DwarfOutputPath,
       std::unordered_map<uint64_t, std::string> DWOToNameMap,
-      uint64_t DeltaDWARF5, BucketMergeAccum &Accum);
+      BucketLocAccum &Accum);
 
   /// append buffers to RangeListsSectionWriter/LegacyRangesSectionWriter
   void appendBucketRangeBuffers(DIEBuilder &PartDIEBlder,
-                                ArrayRef<DWARFUnit *> SortedCUs,
-                                BucketLocalWriter &LocalWriters,
-                                BucketMergeAccum &Accum);
+                                std::vector<DWARFUnit *> SortedCUs,
+                                BucketLocalWriter &LocalWriters);
 
   /// Process and write out CUs that are passed in.
   void finalizeCompileUnits(DIEBuilder &DIEBlder, DIEBuilder &MainDIEBlder,
@@ -182,10 +181,11 @@ private:
                              CUOffsetMap &CUMap,
                              DebugAddrWriter &FinalAddrWriter,
                              std::vector<uint64_t> SortedCU);
-
-  /// Patches the binary for DWARF address ranges (e.g. in functions and lexical
-  /// blocks) to be updated.
-  void updateDebugAddressRanges();
+  void processMainBinaryCU(DWARFUnit &Unit, DIEBuilder &DIEBlder,
+                           BucketLocalWriter &LocalWriter);
+      /// Patches the binary for DWARF address ranges (e.g. in functions and
+      /// lexical blocks) to be updated.
+      void updateDebugAddressRanges();
 
   /// DWARFDie contains a pointer to a DIE and hence gets invalidated once the
   /// embedded DIE is destroyed. This wrapper class stores a DIE internally and
