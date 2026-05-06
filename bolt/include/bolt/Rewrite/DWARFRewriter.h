@@ -183,9 +183,9 @@ private:
                              std::vector<uint64_t> SortedCU);
   void processMainBinaryCU(DWARFUnit &Unit, DIEBuilder &DIEBlder,
                            BucketLocalWriter &LocalWriter);
-      /// Patches the binary for DWARF address ranges (e.g. in functions and
-      /// lexical blocks) to be updated.
-      void updateDebugAddressRanges();
+  /// Patches the binary for DWARF address ranges (e.g. in functions and
+  /// lexical blocks) to be updated.
+  void updateDebugAddressRanges();
 
   /// DWARFDie contains a pointer to a DIE and hence gets invalidated once the
   /// embedded DIE is destroyed. This wrapper class stores a DIE internally and

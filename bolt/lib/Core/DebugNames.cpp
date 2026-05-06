@@ -12,8 +12,8 @@
 #include "llvm/DebugInfo/DWARF/LowLevel/DWARFExpression.h"
 #include "llvm/Support/EndianStream.h"
 #include "llvm/Support/LEB128.h"
-#include <cstdint>
 #include <climits>
+#include <cstdint>
 #include <optional>
 #include <tuple>
 
@@ -66,7 +66,6 @@ DWARF5AcceleratorTable::DWARF5AcceleratorTable(
   }
 }
 
-// 
 void DWARF5AcceleratorTable::preAllocateUnits(DWARFContext &DwCtx) {
   // Collect all DWO IDs in deterministic order (by CU offset in .debug_info).
   // This is single-threaded, called before parallel process.

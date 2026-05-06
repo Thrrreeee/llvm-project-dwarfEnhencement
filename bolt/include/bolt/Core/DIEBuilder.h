@@ -340,10 +340,11 @@ public:
   void assignAbbrev(DIEAbbrev &Abbrev);
   void syncAbbrevTableFrom(const DIEBuilder &SrcBuilder);
 
-  /// Set the base offset for CU emission, used by the incremental merge pipeline
-  void setUnitOffsetBases(uint64_t Base) { 
-    DebugNamesUnitSize = Base; 
-    UnitSize = Base; 
+  /// Set the base offset for CU emission, used by the incremental merge
+  /// pipeline
+  void setUnitOffsetBases(uint64_t Base) {
+    DebugNamesUnitSize = Base;
+    UnitSize = Base;
   }
 
   /// Finish current DIE construction.
@@ -393,18 +394,18 @@ public:
     return Die->deleteValue(Attribute);
   }
   /// Updates DWO Name and Compilation directory for Skeleton CU \p Unit.
-  std::string updateDWONameCompDir(DebugStrOffsetsWriter &StrOffstsWriter,
-                                   DebugStrWriter &StrWriter,
-                                   DWARFUnit &SkeletonCU,
-                                   std::optional<StringRef> DwarfOutputPath,
-                                   std::optional<StringRef> DWONameToUse,
-                                   std::unordered_map<uint64_t, std::string> &DWOIDToName);
+  std::string
+  updateDWONameCompDir(DebugStrOffsetsWriter &StrOffstsWriter,
+                       DebugStrWriter &StrWriter, DWARFUnit &SkeletonCU,
+                       std::optional<StringRef> DwarfOutputPath,
+                       std::optional<StringRef> DWONameToUse,
+                       std::unordered_map<uint64_t, std::string> &DWOIDToName);
   /// Updates DWO Name and Compilation directory for Type Units.
-  void updateDWONameCompDirForTypes(DebugStrOffsetsWriter &StrOffstsWriter,
-                                    DebugStrWriter &StrWriter, DWARFUnit &Unit,
-                                    std::optional<StringRef> DwarfOutputPath,
-                                    const StringRef DWOName,
-                                    std::unordered_map<uint64_t, std::string> &DWOIDToName);
+  void updateDWONameCompDirForTypes(
+      DebugStrOffsetsWriter &StrOffstsWriter, DebugStrWriter &StrWriter,
+      DWARFUnit &Unit, std::optional<StringRef> DwarfOutputPath,
+      const StringRef DWOName,
+      std::unordered_map<uint64_t, std::string> &DWOIDToName);
 };
 } // namespace bolt
 } // namespace llvm

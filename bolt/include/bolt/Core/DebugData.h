@@ -573,7 +573,7 @@ public:
 
   /// Returns the current size (in bytes) of the serialized location buffer.
   uint64_t getLocBufferSize() const { return LocBuffer->size(); }
-  
+
   /// Applies an additional base offset to all non-empty location list offsets
   /// recorded for this CU.
   void applyBase(DIEBuilder &DIEBldr, uint64_t Base);
@@ -587,7 +587,8 @@ public:
 protected:
   std::unique_ptr<DebugBufferVector> LocBuffer;
   std::unique_ptr<raw_svector_ostream> LocStream;
-  /// Current offset in this writer's local buffer (updated as new entries are written).
+  /// Current offset in this writer's local buffer (updated as new entries are
+  /// written).
   uint32_t LocSectionOffset{0};
   uint8_t DwarfVersion{4};
   LocWriterKind Kind{LocWriterKind::DebugLocWriter};

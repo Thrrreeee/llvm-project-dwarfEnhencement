@@ -595,7 +595,7 @@ void DebugLocWriter::addList(DIEBuilder &DIEBldr, DIE &Die, DIEValue &AttrInfo,
   }
   LocStream->write_zeros(16);
   LocSectionOffset = LocBuffer->size();
-  LocListDebugInfoPatches.push_back({0xdeadbeee, EntryOffset}); 
+  LocListDebugInfoPatches.push_back({0xdeadbeee, EntryOffset});
   replaceLocValbyForm(DIEBldr, Die, AttrInfo, AttrInfo.getForm(), EntryOffset);
   LocListPatches.push_back({&Die, AttrInfo.getAttribute(), AttrInfo.getForm()});
 }
@@ -772,13 +772,12 @@ void DebugLoclistWriter::finalizeDWARF5(DIEBuilder &DIEBldr, DIE &Die) {
     DIEValue LocListBaseAttrInfo =
         Die.findAttribute(dwarf::DW_AT_loclists_base);
     if (LocListBaseAttrInfo.getType()) {
-      DIEBldr.replaceValue(
-          &Die, dwarf::DW_AT_loclists_base, LocListBaseAttrInfo.getForm(),
-          DIEInteger(LocalBase));
+      DIEBldr.replaceValue(&Die, dwarf::DW_AT_loclists_base,
+                           LocListBaseAttrInfo.getForm(),
+                           DIEInteger(LocalBase));
     } else {
       DIEBldr.addValue(&Die, dwarf::DW_AT_loclists_base,
-                       dwarf::DW_FORM_sec_offset,
-                       DIEInteger(LocalBase));
+                       dwarf::DW_FORM_sec_offset, DIEInteger(LocalBase));
     }
   }
   clearList(RelativeLocListOffsets);
